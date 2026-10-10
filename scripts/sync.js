@@ -17,7 +17,12 @@ if (!SB_URL || !SB_KEY) {
 
 const NGUONC_BASE = "https://phim.nguonc.com/api";
 const KKPHIM_BASE = "https://phimapi.com";
-const UA = "Mozilla/5.0 (compatible; NhotPhimSync/1.0)";
+const BROWSER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Cache-Control": "no-cache",
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -31,16 +36,27 @@ function extractEpNum(str) {
   const m = String(str || "").match(/\d+/);
   return m ? parseInt(m[0]) : 0;
 }
-async function fetchJson(url, ms = 15000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal, headers: { "User-Agent": UA, Accept: "application/json" } });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } finally {
-    clearTimeout(t);
+async function fetchJson(url, ms = 15000, referer = "") {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    try {
+      const headers = { ...BROWSER_HEADERS };
+      if (referer) { headers.Referer = referer; headers.Origin = referer.replace(/\/$/, ""); }
+      const r = await fetch(url, { signal: ctrl.signal, headers });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+      // 403/404 thử lại cũng vô ích, chỉ thử lại khi lỗi mạng/timeout/5xx
+      if (/HTTP (403|404)/.test(e.message)) break;
+      await sleep(1500 * attempt);
+    } finally {
+      clearTimeout(t);
+    }
   }
+  throw lastErr;
 }
 function pickVietsubServerData(eps) {
   if (!Array.isArray(eps) || !eps.length) return [];
@@ -68,7 +84,7 @@ function mergeEpisodes(oldEps, newEps, newLink2List) {
 // ---------- NguonC ----------
 async function nguoncSearch(keyword, limit = 10) {
   try {
-    const d = await fetchJson(`${NGUONC_BASE}/films/search?keyword=${encodeURIComponent(keyword)}`);
+    const d = await fetchJson(`${NGUONC_BASE}/films/search?keyword=${encodeURIComponent(keyword)}`, 15000, "https://phim.nguonc.com/");
     return (d?.items || []).slice(0, limit).map((it) => ({
       name: it.name || it.original_name || "",
       origin_name: it.original_name || "",
@@ -82,7 +98,7 @@ async function nguoncSearch(keyword, limit = 10) {
 }
 async function nguoncDetail(slug) {
   try {
-    const d = await fetchJson(`${NGUONC_BASE}/film/${slug}`);
+    const d = await fetchJson(`${NGUONC_BASE}/film/${slug}`, 15000, "https://phim.nguonc.com/");
     const m = d?.movie;
     if (!m) return { movie: null, episodes: [] };
     return {
@@ -101,14 +117,14 @@ async function nguoncDetail(slug) {
     };
   } catch (e) {
     console.warn("  NguonC detail lỗi:", e.message);
-    return { movie: null, episodes: [] };
+    return { movie: null, episodes: [], error: true };
   }
 }
 
 // ---------- KKPhim ----------
 async function kkSearch(keyword) {
   try {
-    const d = await fetchJson(`${KKPHIM_BASE}/v1/api/tim-kiem?keyword=${encodeURIComponent(keyword)}`);
+    const d = await fetchJson(`${KKPHIM_BASE}/v1/api/tim-kiem?keyword=${encodeURIComponent(keyword)}`, 15000, "https://phimapi.com/");
     return d?.data?.items || [];
   } catch (e) {
     console.warn("  KKPhim search lỗi:", e.message);
@@ -117,7 +133,7 @@ async function kkSearch(keyword) {
 }
 async function kkDetail(slug) {
   try {
-    const d = await fetchJson(`${KKPHIM_BASE}/phim/${slug}`);
+    const d = await fetchJson(`${KKPHIM_BASE}/phim/${slug}`, 15000, "https://phimapi.com/");
     if (!d?.movie) return { movie: null, episodes: [] };
     return {
       movie: {
@@ -273,8 +289,14 @@ async function main() {
 
       if (slug) {
         const { movie, episodes } = await nguoncDetail(slug);
-        if (!movie) { failed++; await sleep(350); continue; }
-
+        if (!movie) {
+          // NguonC lỗi/bị chặn → vẫn thử lấy tập mới từ KKPhim (SV1 giữ nguyên)
+          console.warn("  NguonC không dùng được, thử KKPhim...");
+          result = await syncFromKKOnly(m);
+          if (!result) { failed++; await sleep(350); continue; }
+          slug = null; slugChanged = false;
+        }
+        if (movie) {
         // Xác minh slug đúng phim
         const q = normalizeStr((m.title || m.titleen || "").trim());
         const n = normalizeStr(movie.name);
@@ -296,6 +318,7 @@ async function main() {
             fallbackCount: embedEps.filter((e) => e.link).length,
           });
           if (slugChanged) result.fields.ophim_slug = slug;
+        }
         }
       } else {
         result = await syncFromKKOnly(m);
