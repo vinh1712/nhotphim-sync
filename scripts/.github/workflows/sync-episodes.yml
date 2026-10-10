@@ -1,0 +1,28 @@
+name: Sync tập mới NhotPhim
+
+on:
+  schedule:
+    # Mỗi tối 22:00 giờ Việt Nam = 15:00 UTC
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Chạy thử (không ghi vào DB)"
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Chạy sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: node scripts/sync.js
