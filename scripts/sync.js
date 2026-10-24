@@ -1,6 +1,8 @@
 // Sync tập mới cho NhotPhim — chạy bằng GitHub Actions (Node 20+, không cần cài thư viện).
 // Logic port từ batchAutoFillLinks() trong file HTML.
-// Nguồn dữ liệu: NguonC (SV1), KKPhim (SV2), VodPhim/api.xink.pro (SV3 - mới thêm).
+// Nguồn dữ liệu: KKPhim (SV2) là nguồn chính, VodPhim/api.xink.pro (SV3) bổ sung.
+// NguonC (SV1) ĐÃ BỊ CHẶN BOT nên không còn dùng để sync tập nữa — code NguonC vẫn
+// giữ lại (chỉ dùng làm phương án cuối khi tìm ảnh poster thay thế, nếu còn ophim_slug cũ).
 // Ngoài sync tập mới, script còn:
 //   - Tự thêm phim MỚI (hiện chỉ lọc quốc gia Hàn Quốc) từ VodPhim, nếu DB chưa có
 //   - Bổ sung link2/link3 còn thiếu cho phim ĐÃ "Hoàn thành" (vì lúc đó SV2/SV3
@@ -81,6 +83,30 @@ function normalizeStr(s) {
   return (s || "").toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/đ/g, "d").replace(/Đ/g, "D");
+}
+// Chuẩn hóa mạnh tay hơn normalizeStr, dùng riêng cho việc dò trùng phim: bỏ phần
+// trong ngoặc (năm, "Thuyết Minh"...), bỏ hết ký tự đặc biệt/khoảng trắng thừa —
+// để "Hạ Cánh Nơi Anh (2019)" và "Hạ cánh nơi anh - Thuyết minh" vẫn được coi là
+// cùng một phim thay vì lệch 1 ký tự là bị thêm trùng.
+function dedupKey(s) {
+  return normalizeStr(s)
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\b(thuyet minh|vietsub|long tieng|full|hd|phan\s*\d+|season\s*\d+|phần\s*\d+)\b/gi, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+function isDuplicateMovie(candTitle, candTitleEn, candYear, existingList) {
+  const ct = dedupKey(candTitle);
+  const ce = candTitleEn ? dedupKey(candTitleEn) : "";
+  const cy = parseInt(candYear) || 0;
+  return existingList.some((e) => {
+    const yearOk = !cy || !e.year || Math.abs(cy - e.year) <= 1;
+    if (!yearOk) return false;
+    if (ct && (ct === e.titleKey || ct === e.titleEnKey)) return true;
+    if (ce && (ce === e.titleKey || ce === e.titleEnKey)) return true;
+    return false;
+  });
 }
 function extractEpNum(str) {
   const m = String(str || "").match(/\d+/);
@@ -495,14 +521,7 @@ async function findReplacementPoster(m) {
   const title = (m.titleen || m.title || "").trim();
   if (!title) return "";
 
-  try {
-    const slug = m.ophim_slug || (await findNguoncSlugByTitle(m));
-    if (slug) {
-      const { movie } = await nguoncDetail(slug);
-      if (movie?.thumb_url) return movie.thumb_url;
-    }
-  } catch {}
-
+  // KKPhim và VodPhim thử trước — NguonC để cuối cùng vì hay bị chặn bot, ít khi dùng được
   try {
     const items = await kkSearch(title);
     if (items.length) {
@@ -515,6 +534,14 @@ async function findReplacementPoster(m) {
     const items = await vpSearch(title);
     if (items.length) {
       const { movie } = await vpDetail(items[0].slug);
+      if (movie?.thumb_url) return movie.thumb_url;
+    }
+  } catch {}
+
+  try {
+    const slug = m.ophim_slug;
+    if (slug) {
+      const { movie } = await nguoncDetail(slug);
       if (movie?.thumb_url) return movie.thumb_url;
     }
   } catch {}
@@ -630,18 +657,18 @@ async function backfillMissingSV() {
 async function loadExistingTitleKeys() {
   const cols = "title,titleen,year";
   const PAGE = 1000;
-  const out = new Set();
+  const out = [];
   for (let offset = 0; ; offset += PAGE) {
     const url = `${SB_URL}/rest/v1/movies?select=${cols}&order=id.asc&limit=${PAGE}&offset=${offset}`;
     const r = await fetch(url, { headers: SB_HEADERS });
     if (!r.ok) throw new Error(`Đọc bảng movies (check trùng tên) lỗi: ${r.status} ${await r.text()}`);
     const rows = await r.json();
     rows.forEach((m) => {
-      const y = m.year || "";
-      const t1 = normalizeStr(m.title || "");
-      const t2 = normalizeStr(m.titleen || "");
-      if (t1) out.add(t1 + "|" + y);
-      if (t2) out.add(t2 + "|" + y);
+      out.push({
+        titleKey: dedupKey(m.title || ""),
+        titleEnKey: dedupKey(m.titleen || ""),
+        year: parseInt(m.year) || 0,
+      });
     });
     if (rows.length < PAGE) break;
   }
@@ -724,18 +751,31 @@ async function autoAddNewMoviesByCountry() {
     if (!items.length) { console.log(`  Trang ${page}: không có dữ liệu, dừng quét.`); break; }
     for (const it of items) {
       scanned++;
-      const key1 = normalizeStr(it.name) + "|" + (it.year || "");
-      const key2 = it.origin_name ? normalizeStr(it.origin_name) + "|" + (it.year || "") : null;
-      if (existing.has(key1) || (key2 && existing.has(key2))) { skippedDup++; continue; }
+      if (isDuplicateMovie(it.name, it.origin_name, it.year, existing)) {
+        console.log(`  = Đã có trong DB, bỏ qua: ${it.name}`);
+        skippedDup++;
+        continue;
+      }
       try {
         const { movie, episodes } = await vpDetail(it.slug);
         if (!movie) { failed++; await sleep(200); continue; }
         movie._episodes = episodes;
+        // Kiểm tra lại lần nữa bằng dữ liệu detail đầy đủ (title/năm chi tiết có
+        // thể khác với dữ liệu rút gọn ở trang danh sách)
+        if (isDuplicateMovie(movie.name, movie.origin_name, movie.year, existing)) {
+          console.log(`  = Đã có trong DB (khớp sau khi xem chi tiết), bỏ qua: ${movie.name}`);
+          skippedDup++;
+          continue;
+        }
         const payload = buildNewMovieFromVP(movie);
         console.log(`  + Phim mới: ${payload.title} (${payload.type}, ${movie.year || "?"})`);
         if (await insertMovie(payload)) {
           added++;
-          existing.add(normalizeStr(payload.title) + "|" + (payload.year || ""));
+          existing.push({
+            titleKey: dedupKey(payload.title),
+            titleEnKey: dedupKey(payload.titleen),
+            year: parseInt(payload.year) || 0,
+          });
         } else failed++;
       } catch (e) {
         console.warn(`  Lỗi khi thêm "${it.name}":`, e.message);
@@ -769,55 +809,9 @@ async function main() {
     const m = targets[idx];
     console.log(`[${idx + 1}/${targets.length}] ${m.title}`);
     try {
-      let slug = m.ophim_slug;
-      let slugChanged = false;
-      let result = null;
-
-      if (!slug) {
-        slug = await findNguoncSlugByTitle(m);
-        if (slug) slugChanged = true;
-      }
-
-      if (slug) {
-        const { movie, episodes } = await nguoncDetail(slug);
-        if (!movie) {
-          // NguonC lỗi/bị chặn → vẫn thử lấy tập mới từ KKPhim (SV1 giữ nguyên)
-          console.warn("  NguonC không dùng được, thử KKPhim...");
-          result = await syncFromKKOnly(m);
-          if (!result) { failed++; await sleep(350); continue; }
-          slug = null; slugChanged = false;
-        }
-        if (movie) {
-        // Xác minh slug đúng phim
-        const q = normalizeStr((m.title || m.titleen || "").trim());
-        const n = normalizeStr(movie.name);
-        const o = normalizeStr(movie.origin_name);
-        if (q && n !== q && o !== q) {
-          console.warn(`  Slug không khớp (NguonC trả về: ${movie.name}) → gỡ slug, dùng KKPhim`);
-          if (m.ophim_slug) await patchMovie(m.id, { ophim_slug: null });
-          result = await syncFromKKOnly(m);
-          slug = null; slugChanged = false;
-        } else {
-          const serverData = pickVietsubServerData(episodes);
-          const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: ep.link_embed || "" }));
-          const kk = await getKKFullData(m);
-          const link2Eps = embedEps.map((_, i) => kk.serverData[i]?.link_embed || "");
-          console.log(`  SV2 (KKPhim): ${kk.movie ? `khớp phim, điền ${link2Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên KKPhim"}`);
-          const vp = await getVPFullData(m);
-          const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
-          console.log(`  SV3 (VodPhim): ${vp.movie ? `khớp phim, điền ${link3Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên VodPhim"}`);
-          result = buildUpdate(m, {
-            embedEps, link2Eps, link3Eps,
-            curEpText: movie.episode_current,
-            totalFromSource: movie.episode_total,
-            fallbackCount: embedEps.filter((e) => e.link).length,
-          });
-          if (slugChanged) result.fields.ophim_slug = slug;
-        }
-        }
-      } else {
-        result = await syncFromKKOnly(m);
-      }
+      // NguonC (SV1) bị chặn bot nên không dùng nữa — chỉ dựa vào KKPhim (SV2)
+      // làm nguồn chính để biết danh sách tập + VodPhim (SV3) bổ sung link.
+      const result = await syncFromKKOnly(m);
 
       if (!result) { notFound++; await sleep(350); continue; }
 
