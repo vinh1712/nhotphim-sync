@@ -10,6 +10,10 @@ on:
         description: "Chạy thử (không ghi vào DB)"
         type: boolean
         default: false
+      skip_poster_fix:
+        description: "Bỏ qua bước rà soát/sửa ảnh poster lỗi"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -25,4 +29,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          SKIP_POSTER_FIX: ${{ inputs.skip_poster_fix && '1' || '0' }}
         run: node scripts/sync.js
