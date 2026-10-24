@@ -98,6 +98,18 @@ function dedupKey(s) {
     .trim()
     .replace(/\s+/g, " ");
 }
+// So khớp 2 key đã chuẩn hóa: khớp y hệt, HOẶC 1 chuỗi chứa trọn chuỗi kia (bắt
+// được trường hợp nguồn gắn thêm tiền tố/hậu tố quảng cáo, vd VodPhim hay thêm
+// "Play Me: " trước tên gốc — "play me buoi dien tap cua chung ta" chứa trọn
+// "buoi dien tap cua chung ta" đã lưu trong DB). Yêu cầu chuỗi ngắn hơn phải đủ
+// dài (>=6 ký tự) để tránh khớp nhầm với tên quá ngắn kiểu "Yêu", "Hè"...
+function keysMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  return shorter.length >= 6 && longer.includes(shorter);
+}
 function isDuplicateMovie(candTitle, candTitleEn, candYear, existingList) {
   const ct = dedupKey(candTitle);
   const ce = candTitleEn ? dedupKey(candTitleEn) : "";
@@ -105,8 +117,8 @@ function isDuplicateMovie(candTitle, candTitleEn, candYear, existingList) {
   return existingList.some((e) => {
     const yearOk = !cy || !e.year || Math.abs(cy - e.year) <= 1;
     if (!yearOk) return false;
-    if (ct && (ct === e.titleKey || ct === e.titleEnKey)) return true;
-    if (ce && (ce === e.titleKey || ce === e.titleEnKey)) return true;
+    if (keysMatch(ct, e.titleKey) || keysMatch(ct, e.titleEnKey)) return true;
+    if (ce && (keysMatch(ce, e.titleKey) || keysMatch(ce, e.titleEnKey))) return true;
     return false;
   });
 }
