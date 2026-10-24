@@ -14,6 +14,14 @@ on:
         description: "Bỏ qua bước rà soát/sửa ảnh poster lỗi"
         type: boolean
         default: false
+      skip_backfill_sv:
+        description: "Bỏ qua bước bổ sung SV2/SV3 cho phim đã hoàn thành"
+        type: boolean
+        default: false
+      skip_auto_add:
+        description: "Bỏ qua bước tự thêm phim mới (Hàn Quốc, VodPhim)"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -30,4 +38,6 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           SKIP_POSTER_FIX: ${{ inputs.skip_poster_fix && '1' || '0' }}
+          SKIP_BACKFILL_SV: ${{ inputs.skip_backfill_sv && '1' || '0' }}
+          SKIP_AUTO_ADD: ${{ inputs.skip_auto_add && '1' || '0' }}
         run: node scripts/sync.js
