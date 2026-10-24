@@ -1,14 +1,18 @@
 // Sync tập mới cho NhotPhim — chạy bằng GitHub Actions (Node 20+, không cần cài thư viện).
 // Logic port từ batchAutoFillLinks() trong file HTML.
+// Nguồn dữ liệu: NguonC (SV1), KKPhim (SV2), VodPhim/api.xink.pro (SV3 - mới thêm).
+// Ngoài sync tập mới, script còn tự rà soát và sửa ảnh poster bị lỗi (404) trong DB.
 //
 // Biến môi trường:
 //   SUPABASE_URL          vd https://tlbumpjugtltznzuwqwt.supabase.co
 //   SUPABASE_SERVICE_KEY  service_role key (CHỈ để trong GitHub Secrets)
 //   DRY_RUN=1             (tùy chọn) chỉ in log, không ghi vào DB
+//   SKIP_POSTER_FIX=1     (tùy chọn) bỏ qua bước rà soát/sửa ảnh poster lỗi
 
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const DRY_RUN = process.env.DRY_RUN === "1";
+const SKIP_POSTER_FIX = process.env.SKIP_POSTER_FIX === "1";
 
 if (!SB_URL || !SB_KEY) {
   console.error("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY");
@@ -17,6 +21,7 @@ if (!SB_URL || !SB_KEY) {
 
 const NGUONC_BASE = "https://phim.nguonc.com/api";
 const KKPHIM_BASE = "https://phimapi.com";
+const VODPHIM_BASE = "https://api.xink.pro/api/content";
 const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
@@ -71,13 +76,22 @@ function pickVietsubServerData(eps) {
   for (const sv of pool) if ((sv.server_data || []).length > (best.server_data || []).length) best = sv;
   return best?.server_data || [];
 }
-function mergeEpisodes(oldEps, newEps, newLink2List) {
+function mergeEpisodes(oldEps, newEps, newLink2List, newLink3List) {
   const oldMap = {};
   (oldEps || []).forEach((e) => { if (e && e.name) oldMap[e.name] = e; });
   return newEps.map((e, i) => {
     const old = oldMap[e.name] || {};
     const auto2 = newLink2List && newLink2List[i] ? newLink2List[i] : "";
-    return { name: e.name, link: e.link || old.link || "", link2: old.link2 || auto2 || "" };
+    const auto3 = newLink3List && newLink3List[i] ? newLink3List[i] : "";
+    return {
+      name: e.name,
+      link: e.link || old.link || "",
+      // Giữ link cũ nếu đã có; chỉ tự điền link mới khi ô đang trống —
+      // nhờ vậy khi nguồn SV2/SV3 xuất hiện link mới cho tập trước đó
+      // chưa có, lần sync sau sẽ tự điền vào mà không đụng link đã lưu.
+      link2: old.link2 || auto2 || "",
+      link3: old.link3 || auto3 || "",
+    };
   });
 }
 
@@ -105,6 +119,7 @@ async function nguoncDetail(slug) {
       movie: {
         name: m.name || "",
         origin_name: m.original_name || "",
+        thumb_url: m.thumb_url || m.poster_url || "",
         episode_total: parseInt(m.total_episodes) || 0,
         episode_current: m.current_episode || "",
       },
@@ -137,6 +152,9 @@ async function kkDetail(slug) {
     if (!d?.movie) return { movie: null, episodes: [] };
     return {
       movie: {
+        // Lưu ý: field "poster_url" của KKPhim mới thật sự là ảnh poster (dọc),
+        // còn "thumb_url" của họ là ảnh backdrop/thumb (ngang) — ưu tiên poster_url trước.
+        thumb_url: d.movie.poster_url || d.movie.thumb_url || "",
         episode_current: d.movie.episode_current || "",
         episode_total: parseInt(d.movie.episode_total) || 0,
       },
@@ -161,6 +179,65 @@ async function getKKFullData(m) {
   if (!items.length && titleVi && titleVi !== title) items = await kkSearch(titleVi);
   if (!items.length) return { movie: null, serverData: [] };
   const detail = await kkDetail(items[0].slug);
+  if (!detail.movie) return { movie: null, serverData: [] };
+  return { movie: detail.movie, serverData: pickVietsubServerData(detail.episodes) };
+}
+
+// ---------- VodPhim (api.xink.pro) — nguồn cho Server 3 (SV3) ----------
+async function vpSearch(keyword) {
+  try {
+    const d = await fetchJson(`${VODPHIM_BASE}/tim-kiem?q=${encodeURIComponent(keyword)}&page=1&limit=24`, 15000, "https://vodphim.com/");
+    return (d?.items || []).map((it) => ({
+      name: it.name || "",
+      origin_name: it.origin_name || "",
+      slug: it.slug || "",
+      year: it.year || "",
+      thumb_url: it.thumb_url || it.poster_url || "",
+    }));
+  } catch (e) {
+    console.warn("  VodPhim search lỗi:", e.message);
+    return [];
+  }
+}
+async function vpDetail(slug) {
+  try {
+    const d = await fetchJson(`${VODPHIM_BASE}/phim/${encodeURIComponent(slug)}`, 15000, "https://vodphim.com/");
+    const m = d?.movie;
+    if (!m) return { movie: null, episodes: [] };
+    return {
+      movie: {
+        name: m.name || "",
+        origin_name: m.origin_name || "",
+        thumb_url: m.thumb_url || "",
+        episode_current: m.episode_current || "",
+        episode_total: parseInt(m.episode_total) || (d.episodes?.[0]?.server_data?.length || 0),
+      },
+      episodes: (d.episodes || []).map((sv) => ({
+        server_name: sv.server_name || "VodPhim Server",
+        server_data: (sv.server_data || []).map((ep) => ({
+          // VodPhim trả tên tập trong field "filename" (vd "Tập 1"), "name" thường chỉ là số thứ tự
+          name: ep.filename || ep.name || "",
+          link_embed: ep.link_embed || "",
+          link_m3u8: "",
+        })),
+      })),
+    };
+  } catch (e) {
+    console.warn("  VodPhim detail lỗi:", e.message);
+    return { movie: null, episodes: [] };
+  }
+}
+async function getVPFullData(m) {
+  const titleEn = (m.titleen || "").trim();
+  const titleVi = (m.title || "").trim();
+  const title = titleEn || titleVi;
+  if (!title) return { movie: null, serverData: [] };
+  let items = await vpSearch(title);
+  if (!items.length && titleVi && titleVi !== title) items = await vpSearch(titleVi);
+  if (!items.length) return { movie: null, serverData: [] };
+  const q = normalizeStr(title);
+  const pick = items.find((it) => normalizeStr(it.name) === q || normalizeStr(it.origin_name) === q) || items[0];
+  const detail = await vpDetail(pick.slug);
   if (!detail.movie) return { movie: null, serverData: [] };
   return { movie: detail.movie, serverData: pickVietsubServerData(detail.episodes) };
 }
@@ -230,9 +307,9 @@ async function pushNotifs(items) {
 }
 
 // Tính các cột cần cập nhật từ dữ liệu nguồn
-function buildUpdate(m, { embedEps, link2Eps, curEpText, totalFromSource, fallbackCount }) {
+function buildUpdate(m, { embedEps, link2Eps, link3Eps, curEpText, totalFromSource, fallbackCount }) {
   const oldEpisodes = parseEpisodes(m.episodes);
-  const episodes = mergeEpisodes(oldEpisodes, embedEps, link2Eps);
+  const episodes = mergeEpisodes(oldEpisodes, embedEps, link2Eps, link3Eps);
   const curNum = extractEpNum(curEpText) || fallbackCount;
   const low = (curEpText || "").toLowerCase();
   const epStatus = low.includes("hoàn") || low.includes("full") ? "Hoàn thành" : "Đang chiếu";
@@ -250,19 +327,122 @@ function buildUpdate(m, { embedEps, link2Eps, curEpText, totalFromSource, fallba
   return { fields, curNum, ep, hasNewEp: curNum > (m.currentep || 0) };
 }
 
-// Chỉ dùng KKPhim (phim không có trên NguonC): SV1 giữ trống, chỉ điền SV2
+// Chỉ dùng KKPhim (phim không có trên NguonC): SV1 giữ trống, chỉ điền SV2 + SV3
 async function syncFromKKOnly(m) {
   const { movie, serverData } = await getKKFullData(m);
   if (!movie || !serverData.length) return null;
   const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: "" }));
   const link2Eps = serverData.map((ep) => ep.link_embed || "");
   const link2Count = link2Eps.filter(Boolean).length;
+  const vp = await getVPFullData(m);
+  const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
   return buildUpdate(m, {
-    embedEps, link2Eps,
+    embedEps, link2Eps, link3Eps,
     curEpText: movie.episode_current,
     totalFromSource: parseInt(movie.episode_total) || serverData.length || 0,
     fallbackCount: link2Count || serverData.length,
   });
+}
+
+// ---------- Sửa ảnh poster bị lỗi ----------
+async function loadAllMoviesForPosterCheck() {
+  const cols = "id,title,titleen,year,poster,ophim_slug";
+  const PAGE = 500;
+  const out = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const url = `${SB_URL}/rest/v1/movies?select=${cols}&order=id.asc&limit=${PAGE}&offset=${offset}`;
+    const r = await fetch(url, { headers: SB_HEADERS });
+    if (!r.ok) throw new Error(`Đọc bảng movies (check poster) lỗi: ${r.status} ${await r.text()}`);
+    const rows = await r.json();
+    out.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return out;
+}
+
+// Kiểm tra URL ảnh có load được không (HEAD trước, 403/405 thì thử lại bằng GET)
+async function checkImageOk(url) {
+  if (!url) return false;
+  for (const method of ["HEAD", "GET"]) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const r = await fetch(url, { method, signal: ctrl.signal, headers: BROWSER_HEADERS, redirect: "follow" });
+      clearTimeout(t);
+      if (r.ok) return true;
+      if (r.status !== 403 && r.status !== 405) return false; // lỗi thật (404, 410, 5xx...) → không cần thử GET
+    } catch {
+      clearTimeout(t);
+      return false;
+    }
+  }
+  return false;
+}
+
+// Tìm ảnh poster thay thế: ưu tiên NguonC (nếu có slug) → KKPhim → VodPhim
+async function findReplacementPoster(m) {
+  const title = (m.titleen || m.title || "").trim();
+  if (!title) return "";
+
+  try {
+    const slug = m.ophim_slug || (await findNguoncSlugByTitle(m));
+    if (slug) {
+      const { movie } = await nguoncDetail(slug);
+      if (movie?.thumb_url) return movie.thumb_url;
+    }
+  } catch {}
+
+  try {
+    const items = await kkSearch(title);
+    if (items.length) {
+      const { movie } = await kkDetail(items[0].slug);
+      if (movie?.thumb_url) return movie.thumb_url;
+    }
+  } catch {}
+
+  try {
+    const items = await vpSearch(title);
+    if (items.length) {
+      const { movie } = await vpDetail(items[0].slug);
+      if (movie?.thumb_url) return movie.thumb_url;
+    }
+  } catch {}
+
+  return "";
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  let i = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      await worker(items[idx]);
+    }
+  });
+  await Promise.all(runners);
+}
+
+async function fixBrokenPosters() {
+  console.log(`\nRà soát ảnh poster...`);
+  const all = await loadAllMoviesForPosterCheck();
+  let checked = 0, broken = 0, fixed = 0;
+  await runWithConcurrency(all, 8, async (m) => {
+    checked++;
+    const ok = await checkImageOk(m.poster);
+    if (ok) return;
+    broken++;
+    console.warn(`  Ảnh lỗi: [${m.id}] ${m.title}`);
+    const replacement = await findReplacementPoster(m);
+    if (replacement && replacement !== m.poster) {
+      if (await patchMovie(m.id, { poster: replacement })) {
+        fixed++;
+        console.log(`    ✓ Đã thay poster mới`);
+      }
+    } else {
+      console.warn(`    ✗ Không tìm được ảnh thay thế`);
+    }
+  });
+  console.log(`Poster: kiểm tra ${checked}, lỗi ${broken}, đã sửa ${fixed}.`);
 }
 
 // ---------- main ----------
@@ -311,8 +491,10 @@ async function main() {
           const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: ep.link_embed || "" }));
           const kk = await getKKFullData(m);
           const link2Eps = embedEps.map((_, i) => kk.serverData[i]?.link_embed || "");
+          const vp = await getVPFullData(m);
+          const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
           result = buildUpdate(m, {
-            embedEps, link2Eps,
+            embedEps, link2Eps, link3Eps,
             curEpText: movie.episode_current,
             totalFromSource: movie.episode_total,
             fallbackCount: embedEps.filter((e) => e.link).length,
@@ -344,6 +526,15 @@ async function main() {
 
   await pushNotifs(notifs);
   console.log(`Xong! Cập nhật ${success} phim, ${notifs.length} phim có tập mới, ${notFound} chưa có link, ${failed} lỗi.`);
+
+  if (!SKIP_POSTER_FIX) {
+    try {
+      await fixBrokenPosters();
+    } catch (e) {
+      console.error("Lỗi khi rà soát/sửa poster:", e.message);
+    }
+  }
+
   // Chỉ báo fail cả job khi lỗi quá nhiều (để GitHub gửi email cảnh báo)
   if (targets.length && failed > targets.length / 2) process.exit(1);
 }
