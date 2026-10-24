@@ -706,7 +706,7 @@ async function backfillMissingSV() {
 
 // Lấy "chữ ký" title+year của mọi phim đang có trong DB để dò trùng trước khi thêm mới
 async function loadExistingTitleKeys() {
-  const cols = "title,titleen,year";
+  const cols = "id,title,titleen,year,series_group,part_number";
   const PAGE = 1000;
   const out = [];
   for (let offset = 0; ; offset += PAGE) {
@@ -716,9 +716,14 @@ async function loadExistingTitleKeys() {
     const rows = await r.json();
     rows.forEach((m) => {
       out.push({
+        id: m.id,
+        title: m.title || "",
+        titleen: m.titleen || "",
         titleKey: dedupKey(m.title || ""),
         titleEnKey: dedupKey(m.titleen || ""),
         year: parseInt(m.year) || 0,
+        series_group: m.series_group || "",
+        part_number: parseInt(m.part_number) || 0,
       });
     });
     if (rows.length < PAGE) break;
@@ -726,8 +731,48 @@ async function loadExistingTitleKeys() {
   return out;
 }
 
+// Nhận diện "Mùa N" / "Phần N" / "Season N" trong tên phim (VodPhim hay ghi kiểu
+// "[Mùa 2] Tên Phim") → tách ra số phần + tên gốc (không còn tiền tố) để tìm phim
+// Phần 1 đã có trong DB và gộp nhóm. Không khớp được thì trả về null — không cố
+// đoán mò để tránh gộp nhầm 2 phim không liên quan.
+function detectSeasonMarker(title) {
+  if (!title) return null;
+  const patterns = [
+    /\[\s*(?:mùa|mua|season|phần|phan)\s*(\d+)\s*\]/i,
+    /\(\s*(?:mùa|mua|season|phần|phan)\s*(\d+)\s*\)/i,
+    /\b(?:mùa|mua|season|phần|phan)\s*(\d+)\b/i,
+  ];
+  for (const re of patterns) {
+    const m = title.match(re);
+    if (m) {
+      const partNum = parseInt(m[1]);
+      if (!partNum) continue;
+      const baseTitle = title.replace(re, " ").replace(/\s{2,}/g, " ").trim().replace(/^[-:–\s]+|[-:–\s]+$/g, "").trim();
+      if (baseTitle) return { partNum, baseTitle };
+    }
+  }
+  return null;
+}
+
+// Tìm phim đã có trong DB khớp với tên gốc (sau khi bỏ "[Mùa N]") — dùng để gộp
+// nhóm phần với phim mới import. Ưu tiên phim đã có sẵn series_group (gộp đúng
+// nhóm hiện có), gần năm nhất nếu có nhiều ứng viên.
+function findSiblingForGroup(baseTitle, year, existingList) {
+  const bt = dedupKey(baseTitle);
+  if (!bt) return null;
+  const candidates = existingList.filter((e) => keysMatch(bt, e.titleKey) || keysMatch(bt, e.titleEnKey));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => {
+    const ag = a.series_group ? 0 : 1, bg = b.series_group ? 0 : 1;
+    if (ag !== bg) return ag - bg;
+    return Math.abs((a.year || 0) - (year || 0)) - Math.abs((b.year || 0) - (year || 0));
+  });
+  return candidates[0];
+}
+
 // Dựng payload tạo phim mới từ dữ liệu VodPhim (theo đúng cấu trúc saveMovieToDB trong web admin)
-function buildNewMovieFromVP(movie) {
+// groupInfo (nếu có): { seriesGroup, partNumber } — tự nhận từ detectSeasonMarker + findSiblingForGroup
+function buildNewMovieFromVP(movie, groupInfo) {
   const isSingle = movie.type === "single";
   const genres = (movie.category || []).map((g) => GENRE_IMPORT_MAP[(g.name || "").toLowerCase()]).filter(Boolean);
   const countryName = (movie.country?.[0]?.name || "").toLowerCase();
@@ -751,8 +796,8 @@ function buildNewMovieFromVP(movie) {
     videosource: null,
     // Chưa biết slug NguonC — để trống, lần sync chính tiếp theo sẽ tự tìm & gắn vào
     ophim_slug: null,
-    series_group: null,
-    part_number: null,
+    series_group: groupInfo ? groupInfo.seriesGroup : null,
+    part_number: groupInfo ? groupInfo.partNumber : null,
   };
 
   if (isSingle) {
@@ -832,15 +877,48 @@ async function autoAddNewMoviesByCountry() {
           skippedDup++;
           continue;
         }
-        const payload = buildNewMovieFromVP(movie);
+
+        // Nhận diện "[Mùa N]"/"Phần N" trong tên → tìm phim gốc đã có trong DB
+        // để gộp nhóm phần (series_group/part_number)
+        let groupInfo = null;
+        let sibling = null;
+        const seasonInfo = detectSeasonMarker(movie.name) || detectSeasonMarker(movie.origin_name || "");
+        if (seasonInfo) {
+          sibling = findSiblingForGroup(seasonInfo.baseTitle, movie.year, existing);
+          if (sibling) {
+            groupInfo = {
+              seriesGroup: sibling.series_group || sibling.title,
+              partNumber: seasonInfo.partNum,
+            };
+            console.log(`  ↳ Nhận diện Phần ${seasonInfo.partNum} của "${sibling.title}" → gộp nhóm "${groupInfo.seriesGroup}"`);
+          }
+        }
+
+        const payload = buildNewMovieFromVP(movie, groupInfo);
         console.log(`  + Phim mới: ${payload.title} (${payload.type}, ${movie.year || "?"})`);
         if (await insertMovie(payload)) {
           added++;
           existing.push({
+            id: null,
+            title: payload.title,
+            titleen: payload.titleen,
             titleKey: dedupKey(payload.title),
             titleEnKey: dedupKey(payload.titleen),
             year: parseInt(payload.year) || 0,
+            series_group: payload.series_group || "",
+            part_number: payload.part_number || 0,
           });
+          // Phim gốc (Phần 1) thường chưa từng có series_group (vì tính năng này
+          // trước giờ chỉ gán tay) — ghi ngược series_group vào phim gốc để 2 phần
+          // thực sự được gộp chung nhóm trên web, không chỉ phim mới có.
+          if (sibling && !sibling.series_group && sibling.id) {
+            const siblingFields = { series_group: groupInfo.seriesGroup, part_number: sibling.part_number || 1 };
+            if (await patchMovie(sibling.id, siblingFields)) {
+              sibling.series_group = groupInfo.seriesGroup;
+              sibling.part_number = sibling.part_number || 1;
+              console.log(`    ✓ Đã gán series_group cho phim gốc "${sibling.title}" (id=${sibling.id})`);
+            }
+          }
         } else failed++;
       } catch (e) {
         console.warn(`  Lỗi khi thêm "${it.name}":`, e.message);
