@@ -18,6 +18,7 @@
 //   SKIP_AUTO_ADD=1        (tùy chọn) bỏ qua bước tự thêm phim mới
 //   AUTO_ADD_COUNTRY_SLUG  (tùy chọn) slug quốc gia bên VodPhim, mặc định "han-quoc"
 //   AUTO_ADD_PAGES         (tùy chọn) số trang mới nhất quét mỗi lần chạy, mặc định 2
+//   AUTO_ADD_MIN_YEAR      (tùy chọn) chỉ thêm phim có năm >= giá trị này, mặc định 2026
 
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -27,6 +28,7 @@ const SKIP_BACKFILL_SV = process.env.SKIP_BACKFILL_SV === "1";
 const SKIP_AUTO_ADD = process.env.SKIP_AUTO_ADD === "1";
 const AUTO_ADD_COUNTRY_SLUG = process.env.AUTO_ADD_COUNTRY_SLUG || "han-quoc"; // slug quốc gia bên VodPhim
 const AUTO_ADD_PAGES = parseInt(process.env.AUTO_ADD_PAGES) || 2; // số trang mới nhất quét mỗi lần chạy
+const AUTO_ADD_MIN_YEAR = parseInt(process.env.AUTO_ADD_MIN_YEAR) || 2026; // chỉ thêm phim có năm >= giá trị này
 
 if (!SB_URL || !SB_KEY) {
   console.error("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY");
@@ -263,7 +265,7 @@ async function vpSearch(keyword) {
       origin_name: it.origin_name || "",
       slug: it.slug || "",
       year: it.year || "",
-      thumb_url: it.thumb_url || it.poster_url || "",
+      thumb_url: it.poster_url || it.thumb_url || "", // VodPhim ngược field giống KKPhim
     }));
   } catch (e) {
     console.warn("  VodPhim search lỗi:", e.message);
@@ -282,8 +284,11 @@ async function vpDetail(slug) {
         content: m.content || "",
         year: m.year || "",
         type: m.type === "single" || m.type === "movie" || m.type === "theater" ? "single" : "series",
-        thumb_url: m.thumb_url || "",
-        backdrop_url: m.backdrop_url || m.poster_url || m.thumb_url || "",
+        // Lưu ý: giống KKPhim, VodPhim cũng đặt tên field ảnh NGƯỢC so với NguonC —
+        // "poster_url" của họ mới thật sự là ảnh poster (dọc), "thumb_url" là backdrop
+        // (ngang). Trước đây code lấy thumb_url làm poster → bị lộn ảnh. Sửa lại:
+        thumb_url: m.poster_url || m.thumb_url || "",       // ảnh poster thật (dọc)
+        backdrop_url: m.thumb_url || m.poster_url || "",    // ảnh backdrop thật (ngang)
         lang: m.lang || "",
         country: m.country || [],
         category: m.category || [],
@@ -451,21 +456,48 @@ function buildUpdate(m, { embedEps, link2Eps, link3Eps, curEpText, totalFromSour
 }
 
 // Chỉ dùng KKPhim (phim không có trên NguonC): SV1 giữ trống, chỉ điền SV2 + SV3
+// Dò tập mới từ KKPhim (SV2) + VodPhim (SV3) — đối xứng, không bắt buộc phải có
+// cả 2 nguồn (chỉ 1 nguồn tìm thấy phim vẫn chạy được), và khớp SV2/SV3 vào đúng
+// tập theo SỐ TẬP trích từ tên (vd "Tập 5" → 5) thay vì theo vị trí trong mảng —
+// vì 2 nguồn có thể lệch số tập đầu (1 nguồn thiếu tập 1, có tập đặc biệt...),
+// khớp theo vị trí dễ bị lệch hết các tập phía sau.
 async function syncFromKKOnly(m) {
-  const { movie, serverData } = await getKKFullData(m);
-  if (!movie || !serverData.length) return null;
-  const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: "" }));
-  const link2Eps = serverData.map((ep) => ep.link_embed || "");
-  const link2Count = link2Eps.filter(Boolean).length;
-  console.log(`  SV2 (KKPhim): khớp phim, điền ${link2Count}/${embedEps.length} tập`);
+  const kk = await getKKFullData(m);
   const vp = await getVPFullData(m);
-  const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
-  console.log(`  SV3 (VodPhim): ${vp.movie ? `khớp phim, điền ${link3Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên VodPhim"}`);
+  const kkLen = kk.serverData.length;
+  const vpLen = vp.serverData.length;
+
+  console.log(`  SV2 (KKPhim): ${kkLen ? `khớp phim, nguồn có ${kkLen} tập` : "không tìm thấy trên KKPhim"}`);
+  console.log(`  SV3 (VodPhim): ${vpLen ? `khớp phim, nguồn có ${vpLen} tập` : "không tìm thấy trên VodPhim"}`);
+
+  if (!kkLen && !vpLen) return null; // cả 2 nguồn đều không có phim này, đành chịu
+
+  // Lấy nguồn có nhiều tập hơn làm khung chính (tránh bỏ sót tập mới nếu 1 nguồn
+  // ra chậm hơn nguồn kia).
+  const useKK = kkLen >= vpLen;
+  const backbone = useKK ? kk.serverData : vp.serverData;
+  const embedEps = backbone.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: "" }));
+
+  const byEpNum = (serverData) => {
+    const map = {};
+    serverData.forEach((ep, i) => { map[extractEpNum(ep.name) || i + 1] = ep.link_embed || ""; });
+    return map;
+  };
+  const kkMap = byEpNum(kk.serverData);
+  const vpMap = byEpNum(vp.serverData);
+
+  const link2Eps = embedEps.map((ep, i) => kkMap[extractEpNum(ep.name) || i + 1] || "");
+  const link3Eps = embedEps.map((ep, i) => vpMap[extractEpNum(ep.name) || i + 1] || "");
+  const link2Count = link2Eps.filter(Boolean).length;
+  const link3Count = link3Eps.filter(Boolean).length;
+  console.log(`  → Điền SV2: ${link2Count}/${embedEps.length} tập, SV3: ${link3Count}/${embedEps.length} tập`);
+
+  const movie = useKK ? kk.movie : vp.movie;
   return buildUpdate(m, {
     embedEps, link2Eps, link3Eps,
-    curEpText: movie.episode_current,
-    totalFromSource: parseInt(movie.episode_total) || serverData.length || 0,
-    fallbackCount: link2Count || serverData.length,
+    curEpText: movie?.episode_current || "",
+    totalFromSource: parseInt(movie?.episode_total) || backbone.length,
+    fallbackCount: Math.max(link2Count, link3Count) || backbone.length,
   });
 }
 
@@ -603,16 +635,23 @@ async function backfillSV23(m) {
 
   let link2Eps = [];
   let link3Eps = [];
+  const byEpNum = (serverData) => {
+    const map = {};
+    serverData.forEach((ep, i) => { map[extractEpNum(ep.name) || i + 1] = ep.link_embed || ""; });
+    return map;
+  };
 
   if (needLink2) {
     const kk = await getKKFullData(m);
-    link2Eps = oldEpisodes.map((_, i) => kk.serverData[i]?.link_embed || "");
+    const kkMap = byEpNum(kk.serverData);
+    link2Eps = oldEpisodes.map((e, i) => kkMap[extractEpNum(e.name) || i + 1] || "");
     const gained = link2Eps.filter((v, i) => v && !oldEpisodes[i].link2).length;
     console.log(`  SV2 (KKPhim, backfill): ${kk.movie ? `khớp phim, bổ sung thêm ${gained} tập` : "không tìm thấy trên KKPhim"}`);
   }
   if (needLink3) {
     const vp = await getVPFullData(m);
-    link3Eps = oldEpisodes.map((_, i) => vp.serverData[i]?.link_embed || "");
+    const vpMap = byEpNum(vp.serverData);
+    link3Eps = oldEpisodes.map((e, i) => vpMap[extractEpNum(e.name) || i + 1] || "");
     const gained = link3Eps.filter((v, i) => v && !oldEpisodes[i].link3).length;
     console.log(`  SV3 (VodPhim, backfill): ${vp.movie ? `khớp phim, bổ sung thêm ${gained} tập` : "không tìm thấy trên VodPhim"}`);
   }
@@ -743,14 +782,21 @@ async function insertMovie(payload) {
 }
 
 async function autoAddNewMoviesByCountry() {
-  console.log(`\nQuét phim mới từ VodPhim (quốc gia: ${AUTO_ADD_COUNTRY_SLUG}, ${AUTO_ADD_PAGES} trang)...`);
+  console.log(`\nQuét phim mới từ VodPhim (quốc gia: ${AUTO_ADD_COUNTRY_SLUG}, ${AUTO_ADD_PAGES} trang, chỉ lấy từ năm ${AUTO_ADD_MIN_YEAR} trở lên)...`);
   const existing = await loadExistingTitleKeys();
-  let scanned = 0, added = 0, skippedDup = 0, failed = 0;
+  let scanned = 0, added = 0, skippedDup = 0, skippedYear = 0, failed = 0;
   for (let page = 1; page <= AUTO_ADD_PAGES; page++) {
     const items = await vpCountryList(AUTO_ADD_COUNTRY_SLUG, page);
     if (!items.length) { console.log(`  Trang ${page}: không có dữ liệu, dừng quét.`); break; }
     for (const it of items) {
       scanned++;
+      // Lọc theo năm ngay ở bước danh sách nếu có sẵn year (đỡ phải gọi detail
+      // cho phim rõ ràng quá cũ). Nếu list không có year thì để detail quyết.
+      const listYear = parseInt(it.year) || 0;
+      if (listYear && listYear < AUTO_ADD_MIN_YEAR) {
+        skippedYear++;
+        continue;
+      }
       if (isDuplicateMovie(it.name, it.origin_name, it.year, existing)) {
         console.log(`  = Đã có trong DB, bỏ qua: ${it.name}`);
         skippedDup++;
@@ -760,6 +806,13 @@ async function autoAddNewMoviesByCountry() {
         const { movie, episodes } = await vpDetail(it.slug);
         if (!movie) { failed++; await sleep(200); continue; }
         movie._episodes = episodes;
+        const detailYear = parseInt(movie.year) || 0;
+        if (detailYear && detailYear < AUTO_ADD_MIN_YEAR) {
+          console.log(`  - Bỏ qua (năm ${detailYear} < ${AUTO_ADD_MIN_YEAR}): ${movie.name}`);
+          skippedYear++;
+          await sleep(200);
+          continue;
+        }
         // Kiểm tra lại lần nữa bằng dữ liệu detail đầy đủ (title/năm chi tiết có
         // thể khác với dữ liệu rút gọn ở trang danh sách)
         if (isDuplicateMovie(movie.name, movie.origin_name, movie.year, existing)) {
@@ -784,7 +837,7 @@ async function autoAddNewMoviesByCountry() {
       await sleep(300);
     }
   }
-  console.log(`Auto-add (${AUTO_ADD_COUNTRY_SLUG}): quét ${scanned}, thêm mới ${added}, trùng bỏ qua ${skippedDup}, lỗi ${failed}.`);
+  console.log(`Auto-add (${AUTO_ADD_COUNTRY_SLUG}, >= ${AUTO_ADD_MIN_YEAR}): quét ${scanned}, thêm mới ${added}, trùng bỏ qua ${skippedDup}, năm cũ bỏ qua ${skippedYear}, lỗi ${failed}.`);
 }
 
 // ---------- main ----------
