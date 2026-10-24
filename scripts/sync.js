@@ -1,18 +1,30 @@
 // Sync tập mới cho NhotPhim — chạy bằng GitHub Actions (Node 20+, không cần cài thư viện).
 // Logic port từ batchAutoFillLinks() trong file HTML.
 // Nguồn dữ liệu: NguonC (SV1), KKPhim (SV2), VodPhim/api.xink.pro (SV3 - mới thêm).
-// Ngoài sync tập mới, script còn tự rà soát và sửa ảnh poster bị lỗi (404) trong DB.
+// Ngoài sync tập mới, script còn:
+//   - Tự thêm phim MỚI (hiện chỉ lọc quốc gia Hàn Quốc) từ VodPhim, nếu DB chưa có
+//   - Bổ sung link2/link3 còn thiếu cho phim ĐÃ "Hoàn thành" (vì lúc đó SV2/SV3
+//     chưa có, không đụng tới trạng thái/tập hiện tại của phim)
+//   - Tự rà soát và sửa ảnh poster bị lỗi (404/410) trong DB
 //
 // Biến môi trường:
-//   SUPABASE_URL          vd https://tlbumpjugtltznzuwqwt.supabase.co
-//   SUPABASE_SERVICE_KEY  service_role key (CHỈ để trong GitHub Secrets)
-//   DRY_RUN=1             (tùy chọn) chỉ in log, không ghi vào DB
-//   SKIP_POSTER_FIX=1     (tùy chọn) bỏ qua bước rà soát/sửa ảnh poster lỗi
+//   SUPABASE_URL           vd https://tlbumpjugtltznzuwqwt.supabase.co
+//   SUPABASE_SERVICE_KEY   service_role key (CHỈ để trong GitHub Secrets)
+//   DRY_RUN=1              (tùy chọn) chỉ in log, không ghi vào DB
+//   SKIP_POSTER_FIX=1      (tùy chọn) bỏ qua bước rà soát/sửa ảnh poster lỗi
+//   SKIP_BACKFILL_SV=1     (tùy chọn) bỏ qua bước bổ sung SV2/SV3 cho phim đã hoàn thành
+//   SKIP_AUTO_ADD=1        (tùy chọn) bỏ qua bước tự thêm phim mới
+//   AUTO_ADD_COUNTRY_SLUG  (tùy chọn) slug quốc gia bên VodPhim, mặc định "han-quoc"
+//   AUTO_ADD_PAGES         (tùy chọn) số trang mới nhất quét mỗi lần chạy, mặc định 2
 
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 const DRY_RUN = process.env.DRY_RUN === "1";
 const SKIP_POSTER_FIX = process.env.SKIP_POSTER_FIX === "1";
+const SKIP_BACKFILL_SV = process.env.SKIP_BACKFILL_SV === "1";
+const SKIP_AUTO_ADD = process.env.SKIP_AUTO_ADD === "1";
+const AUTO_ADD_COUNTRY_SLUG = process.env.AUTO_ADD_COUNTRY_SLUG || "han-quoc"; // slug quốc gia bên VodPhim
+const AUTO_ADD_PAGES = parseInt(process.env.AUTO_ADD_PAGES) || 2; // số trang mới nhất quét mỗi lần chạy
 
 if (!SB_URL || !SB_KEY) {
   console.error("Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_KEY");
@@ -30,6 +42,39 @@ const BROWSER_HEADERS = {
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Map tên thể loại/quốc gia từ nguồn (tiếng Việt) sang mã nội bộ của web — copy
+// nguyên từ GENRE_IMPORT_MAP/COUNTRY_MAP trong file HTML admin để đồng bộ đúng chuẩn.
+const GENRE_IMPORT_MAP = {
+  "hành động": "action", "tình cảm": "romance", "hài hước": "comedy",
+  "cổ trang": "costumes", "tâm lý": "psychology", "hình sự": "crime",
+  "chiến tranh": "war", "thể thao": "sport", "võ thuật": "martial",
+  "viễn tưởng": "fantasy", "phiêu lưu": "adventure", "khoa học viễn tưởng": "scifi", "khoa học": "scifi",
+  "kinh dị": "horror", "âm nhạc": "music", "thần thoại": "myth",
+  "tài liệu": "documentary", "gia đình": "family", "chính kịch": "drama",
+  "bí ẩn": "mystery", "học đường": "school", "kinh điển": "classic",
+  "18+": "adult", "anime": "anime", "hoạt hình": "anime", "tv shows": "tvshow",
+};
+const COUNTRY_IMPORT_MAP = {
+  "hàn quốc": "kr", "han quoc": "kr", "korea": "kr", "south korea": "kr", "south-korea": "kr", "han-quoc": "kr",
+  "trung quốc": "cn", "trung quoc": "cn", "china": "cn", "trung-quoc": "cn",
+  "đài loan": "tw", "dai loan": "tw", "taiwan": "tw", "dai-loan": "tw",
+  "hồng kông": "hk", "hong kong": "hk", "hong-kong": "hk",
+  "nhật bản": "jp", "nhat ban": "jp", "japan": "jp", "nhat-ban": "jp",
+  "âu mỹ": "us", "au my": "us", "au-my": "us",
+  "mỹ": "us", "my": "us", "usa": "us", "america": "us", "united states": "us", "united-states": "us",
+  "anh": "us", "uk": "us", "anh quốc": "us", "united kingdom": "us", "united-kingdom": "us",
+  "pháp": "us", "phap": "us", "france": "us",
+  "đức": "us", "duc": "us", "germany": "us",
+  "úc": "us", "uc": "us", "australia": "us",
+  "canada": "us", "tây ban nha": "us", "tay ban nha": "us", "spain": "us",
+  "ý": "us", "italy": "us", "nga": "us", "russia": "us",
+  "châu âu": "us", "chau au": "us", "europe": "us", "au-my-tay-au": "us",
+  "indonesia": "us", "philippines": "us", "malaysia": "us", "singapore": "us",
+  "ấn độ": "in", "an do": "in", "india": "in",
+  "việt nam": "vn", "viet nam": "vn", "vietnam": "vn", "viet-nam": "vn",
+  "thái lan": "th", "thai lan": "th", "thailand": "th", "thai-lan": "th",
+};
 
 // ---------- helpers ----------
 function normalizeStr(s) {
@@ -208,7 +253,14 @@ async function vpDetail(slug) {
       movie: {
         name: m.name || "",
         origin_name: m.origin_name || "",
+        content: m.content || "",
+        year: m.year || "",
+        type: m.type === "single" || m.type === "movie" || m.type === "theater" ? "single" : "series",
         thumb_url: m.thumb_url || "",
+        backdrop_url: m.backdrop_url || m.poster_url || m.thumb_url || "",
+        lang: m.lang || "",
+        country: m.country || [],
+        category: m.category || [],
         episode_current: m.episode_current || "",
         episode_total: parseInt(m.episode_total) || (d.episodes?.[0]?.server_data?.length || 0),
       },
@@ -225,6 +277,28 @@ async function vpDetail(slug) {
   } catch (e) {
     console.warn("  VodPhim detail lỗi:", e.message);
     return { movie: null, episodes: [] };
+  }
+}
+
+// Quét danh sách phim theo quốc gia trên VodPhim (dùng cho auto-add phim mới).
+// LƯU Ý: endpoint "/quoc-gia/{slug}" theo đúng chuẩn phổ biến của các site cùng
+// họ Ophim-clone mà VodPhim đang dùng, nhưng chưa gọi thử trực tiếp được từ môi
+// trường này (domain api.xink.pro không trong whitelist mạng của sandbox) — nếu
+// chạy DRY_RUN mà thấy "0 phim" liên tục dù chắc chắn có phim mới, gửi log lại
+// để chỉnh đúng endpoint.
+async function vpCountryList(countrySlug, page) {
+  try {
+    const d = await fetchJson(`${VODPHIM_BASE}/quoc-gia/${encodeURIComponent(countrySlug)}?page=${page}`, 15000, "https://vodphim.com/");
+    const items = d?.items || d?.data?.items || [];
+    return items.map((it) => ({
+      name: it.name || "",
+      origin_name: it.origin_name || "",
+      slug: it.slug || "",
+      year: it.year || "",
+    }));
+  } catch (e) {
+    console.warn(`  VodPhim quốc gia(${countrySlug}) trang ${page} lỗi:`, e.message);
+    return [];
   }
 }
 async function getVPFullData(m) {
@@ -281,6 +355,29 @@ async function loadSeries() {
   return out.filter((m) => m.type !== "movie" && m.epstatus !== "Hoàn thành");
 }
 
+// Phim bộ ĐÃ "Hoàn thành" nhưng còn tập thiếu link2 hoặc link3 (vì lúc đó SV2/SV3
+// chưa có link, hoặc tính năng SV3 lúc đó chưa tồn tại). loadSeries() ở trên không
+// bao giờ quét lại các phim này vì chúng đã "Hoàn thành" — nên cần vòng riêng.
+// (Phim lẻ "type=movie" không dùng mảng episodes[] nên không nằm trong phạm vi này.)
+async function loadMissingSVTargets() {
+  const cols = "id,title,titleen,year,type,episodes,epstatus";
+  const PAGE = 500;
+  const out = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const url = `${SB_URL}/rest/v1/movies?select=${cols}&order=id.asc&limit=${PAGE}&offset=${offset}`;
+    const r = await fetch(url, { headers: SB_HEADERS });
+    if (!r.ok) throw new Error(`Đọc bảng movies (thiếu SV2/SV3) lỗi: ${r.status} ${await r.text()}`);
+    const rows = await r.json();
+    out.push(...rows);
+    if (rows.length < PAGE) break;
+  }
+  return out.filter((m) => {
+    if (m.type === "movie" || m.epstatus !== "Hoàn thành") return false;
+    const eps = parseEpisodes(m.episodes);
+    return eps.length > 0 && eps.some((e) => !e.link2 || !e.link3);
+  });
+}
+
 function parseEpisodes(raw) {
   try {
     const e = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -334,8 +431,10 @@ async function syncFromKKOnly(m) {
   const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: "" }));
   const link2Eps = serverData.map((ep) => ep.link_embed || "");
   const link2Count = link2Eps.filter(Boolean).length;
+  console.log(`  SV2 (KKPhim): khớp phim, điền ${link2Count}/${embedEps.length} tập`);
   const vp = await getVPFullData(m);
   const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
+  console.log(`  SV3 (VodPhim): ${vp.movie ? `khớp phim, điền ${link3Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên VodPhim"}`);
   return buildUpdate(m, {
     embedEps, link2Eps, link3Eps,
     curEpText: movie.episode_current,
@@ -360,23 +459,35 @@ async function loadAllMoviesForPosterCheck() {
   return out;
 }
 
-// Kiểm tra URL ảnh có load được không (HEAD trước, 403/405 thì thử lại bằng GET)
+// Kiểm tra URL ảnh có load được không.
+// Lưu ý: nhiều CDN ảnh phim không hỗ trợ HEAD đúng chuẩn (trả 400/404/5xx dù ảnh
+// vẫn sống) nên dùng GET cho chắc, nhưng hủy tải phần body ngay sau khi có header
+// để không tốn băng thông tải cả ảnh. Trả về:
+//   "ok"      — ảnh còn sống
+//   "broken"  — chắc chắn chết (404/410: tài nguyên không còn tồn tại)
+//   "unknown" — lỗi mơ hồ (403/429/5xx/timeout/mạng...) — CÓ THỂ do IP máy chủ
+//               Actions bị CDN chặn tạm thời chứ không hẳn ảnh hỏng, không nên
+//               coi là lỗi thật để tránh ghi đè nhầm poster đang chạy tốt.
 async function checkImageOk(url) {
-  if (!url) return false;
-  for (const method of ["HEAD", "GET"]) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    try {
-      const r = await fetch(url, { method, signal: ctrl.signal, headers: BROWSER_HEADERS, redirect: "follow" });
-      clearTimeout(t);
-      if (r.ok) return true;
-      if (r.status !== 403 && r.status !== 405) return false; // lỗi thật (404, 410, 5xx...) → không cần thử GET
-    } catch {
-      clearTimeout(t);
-      return false;
-    }
+  if (!url) return "broken";
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(url, {
+      method: "GET",
+      signal: ctrl.signal,
+      headers: { ...BROWSER_HEADERS, Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
+      redirect: "follow",
+    });
+    try { await r.body?.cancel(); } catch {}
+    if (r.ok) return "ok";
+    if (r.status === 404 || r.status === 410) return "broken";
+    return "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    clearTimeout(t);
   }
-  return false;
 }
 
 // Tìm ảnh poster thay thế: ưu tiên NguonC (nếu có slug) → KKPhim → VodPhim
@@ -425,13 +536,20 @@ async function runWithConcurrency(items, limit, worker) {
 async function fixBrokenPosters() {
   console.log(`\nRà soát ảnh poster...`);
   const all = await loadAllMoviesForPosterCheck();
-  let checked = 0, broken = 0, fixed = 0;
-  await runWithConcurrency(all, 8, async (m) => {
+  let checked = 0, broken = 0, unknown = 0, fixed = 0;
+  // Concurrency thấp hơn + có khoảng nghỉ nhỏ để không bị CDN ảnh coi là bot rồi chặn hàng loạt
+  await runWithConcurrency(all, 4, async (m) => {
     checked++;
-    const ok = await checkImageOk(m.poster);
-    if (ok) return;
+    const status = await checkImageOk(m.poster);
+    if (status === "ok") return;
+    if (status === "unknown") {
+      unknown++;
+      console.warn(`  ? Không chắc (có thể do mạng/CDN chặn tạm): [${m.id}] ${m.title} — bỏ qua, không sửa`);
+      return;
+    }
+    // status === "broken": chắc chắn ảnh không còn tồn tại (404/410)
     broken++;
-    console.warn(`  Ảnh lỗi: [${m.id}] ${m.title}`);
+    console.warn(`  ✗ Ảnh chết hẳn: [${m.id}] ${m.title}`);
     const replacement = await findReplacementPoster(m);
     if (replacement && replacement !== m.poster) {
       if (await patchMovie(m.id, { poster: replacement })) {
@@ -441,13 +559,206 @@ async function fixBrokenPosters() {
     } else {
       console.warn(`    ✗ Không tìm được ảnh thay thế`);
     }
+    await sleep(200);
   });
-  console.log(`Poster: kiểm tra ${checked}, lỗi ${broken}, đã sửa ${fixed}.`);
+  console.log(`Poster: kiểm tra ${checked}, chết hẳn ${broken} (đã sửa ${fixed}), không chắc/bỏ qua ${unknown}.`);
+}
+
+// ---------- Bổ sung SV2/SV3 còn thiếu cho phim ĐÃ hoàn thành ----------
+// Chỉ điền vào ô link2/link3 đang trống, giữ nguyên hoàn toàn link (SV1), tên tập,
+// currentep/epstatus/ep/totalep — vì phim đã xong rồi, không cần/không nên tính lại.
+async function backfillSV23(m) {
+  const oldEpisodes = parseEpisodes(m.episodes);
+  if (!oldEpisodes.length) return null;
+  const needLink2 = oldEpisodes.some((e) => !e.link2);
+  const needLink3 = oldEpisodes.some((e) => !e.link3);
+  if (!needLink2 && !needLink3) return null;
+
+  let link2Eps = [];
+  let link3Eps = [];
+
+  if (needLink2) {
+    const kk = await getKKFullData(m);
+    link2Eps = oldEpisodes.map((_, i) => kk.serverData[i]?.link_embed || "");
+    const gained = link2Eps.filter((v, i) => v && !oldEpisodes[i].link2).length;
+    console.log(`  SV2 (KKPhim, backfill): ${kk.movie ? `khớp phim, bổ sung thêm ${gained} tập` : "không tìm thấy trên KKPhim"}`);
+  }
+  if (needLink3) {
+    const vp = await getVPFullData(m);
+    link3Eps = oldEpisodes.map((_, i) => vp.serverData[i]?.link_embed || "");
+    const gained = link3Eps.filter((v, i) => v && !oldEpisodes[i].link3).length;
+    console.log(`  SV3 (VodPhim, backfill): ${vp.movie ? `khớp phim, bổ sung thêm ${gained} tập` : "không tìm thấy trên VodPhim"}`);
+  }
+
+  const episodes = mergeEpisodes(
+    oldEpisodes,
+    oldEpisodes.map((e) => ({ name: e.name, link: e.link })),
+    link2Eps,
+    link3Eps
+  );
+  if (JSON.stringify(episodes) === JSON.stringify(oldEpisodes)) return null;
+  return { fields: { episodes: JSON.stringify(episodes) } };
+}
+
+async function backfillMissingSV() {
+  console.log(`\nKiểm tra phim đã hoàn thành còn thiếu link SV2/SV3...`);
+  const list = await loadMissingSVTargets();
+  console.log(`Có ${list.length} phim cần bổ sung.`);
+  let fixedCount = 0, failed = 0;
+  for (let idx = 0; idx < list.length; idx++) {
+    const m = list[idx];
+    console.log(`[Backfill ${idx + 1}/${list.length}] ${m.title}`);
+    try {
+      const result = await backfillSV23(m);
+      if (!result) { console.log("  = Không bổ sung được gì mới"); await sleep(200); continue; }
+      if (await patchMovie(m.id, result.fields)) {
+        fixedCount++;
+        console.log("  ✓ Đã bổ sung link còn thiếu");
+      } else failed++;
+    } catch (e) {
+      console.warn("  Lỗi:", e.message);
+      failed++;
+    }
+    await sleep(350);
+  }
+  console.log(`Backfill SV2/SV3: đã bổ sung cho ${fixedCount}/${list.length} phim, ${failed} lỗi.`);
+}
+
+// ---------- Tự thêm phim mới (hiện chỉ phim Hàn Quốc, nguồn VodPhim) ----------
+
+// Lấy "chữ ký" title+year của mọi phim đang có trong DB để dò trùng trước khi thêm mới
+async function loadExistingTitleKeys() {
+  const cols = "title,titleen,year";
+  const PAGE = 1000;
+  const out = new Set();
+  for (let offset = 0; ; offset += PAGE) {
+    const url = `${SB_URL}/rest/v1/movies?select=${cols}&order=id.asc&limit=${PAGE}&offset=${offset}`;
+    const r = await fetch(url, { headers: SB_HEADERS });
+    if (!r.ok) throw new Error(`Đọc bảng movies (check trùng tên) lỗi: ${r.status} ${await r.text()}`);
+    const rows = await r.json();
+    rows.forEach((m) => {
+      const y = m.year || "";
+      const t1 = normalizeStr(m.title || "");
+      const t2 = normalizeStr(m.titleen || "");
+      if (t1) out.add(t1 + "|" + y);
+      if (t2) out.add(t2 + "|" + y);
+    });
+    if (rows.length < PAGE) break;
+  }
+  return out;
+}
+
+// Dựng payload tạo phim mới từ dữ liệu VodPhim (theo đúng cấu trúc saveMovieToDB trong web admin)
+function buildNewMovieFromVP(movie) {
+  const isSingle = movie.type === "single";
+  const genres = (movie.category || []).map((g) => GENRE_IMPORT_MAP[(g.name || "").toLowerCase()]).filter(Boolean);
+  const countryName = (movie.country?.[0]?.name || "").toLowerCase();
+  // Mặc định "kr" vì đang quét theo quốc gia Hàn, phòng khi VodPhim không trả field country
+  const countryVal = COUNTRY_IMPORT_MAP[countryName] || "kr";
+  const lang = (movie.lang || "").toLowerCase();
+  const sub = lang.includes("thuyết minh") || lang.includes("lồng tiếng") ? "Thuyết minh" : "Vietsub";
+
+  const payload = {
+    title: movie.name,
+    titleen: movie.origin_name || "",
+    year: movie.year || "",
+    genre: genres.join(","),
+    country: countryVal,
+    type: isSingle ? "movie" : "series",
+    rating: "N/A",
+    sub,
+    poster: movie.thumb_url || "",
+    backdrop: movie.backdrop_url || null,
+    description: (movie.content || "").replace(/<[^>]*>/g, ""),
+    videosource: null,
+    // Chưa biết slug NguonC — để trống, lần sync chính tiếp theo sẽ tự tìm & gắn vào
+    ophim_slug: null,
+    series_group: null,
+    part_number: null,
+  };
+
+  if (isSingle) {
+    const sd = pickVietsubServerData(movie._episodes)[0];
+    payload.embedurl = null;
+    payload.embedurl2 = null;
+    payload.embedurl3 = sd?.link_embed || "";
+    payload.ep = "Full";
+    payload.episodes = null;
+    payload.totalep = null;
+    payload.currentep = null;
+    payload.epstatus = null;
+  } else {
+    const serverData = pickVietsubServerData(movie._episodes);
+    const eps = serverData.map((ep, i) => ({
+      name: ep.name || "Tập " + (i + 1),
+      link: "", link2: "", link3: ep.link_embed || "",
+    }));
+    const curNum = extractEpNum(movie.episode_current) || eps.length;
+    const totalEp = parseInt(movie.episode_total) || eps.length;
+    const low = (movie.episode_current || "").toLowerCase();
+    const epStatus = low.includes("hoàn") || low.includes("full") ? "Hoàn thành" : "Đang chiếu";
+    payload.episodes = JSON.stringify(eps);
+    payload.totalep = totalEp || null;
+    payload.currentep = curNum || null;
+    payload.epstatus = epStatus;
+    payload.ep = epStatus === "Hoàn thành" ? "Full" + (totalEp ? " " + totalEp + " tập" : "") : "Tập " + curNum + (totalEp ? "/" + totalEp : "");
+  }
+  return payload;
+}
+
+async function insertMovie(payload) {
+  if (DRY_RUN) { console.log(`  [DRY_RUN] sẽ thêm phim mới: ${payload.title} (${payload.type})`); return true; }
+  const r = await fetch(`${SB_URL}/rest/v1/movies`, {
+    method: "POST", headers: { ...SB_HEADERS, Prefer: "return=minimal" }, body: JSON.stringify(payload),
+  });
+  if (!r.ok) { console.warn("  Thêm phim lỗi:", r.status, await r.text()); return false; }
+  return true;
+}
+
+async function autoAddNewMoviesByCountry() {
+  console.log(`\nQuét phim mới từ VodPhim (quốc gia: ${AUTO_ADD_COUNTRY_SLUG}, ${AUTO_ADD_PAGES} trang)...`);
+  const existing = await loadExistingTitleKeys();
+  let scanned = 0, added = 0, skippedDup = 0, failed = 0;
+  for (let page = 1; page <= AUTO_ADD_PAGES; page++) {
+    const items = await vpCountryList(AUTO_ADD_COUNTRY_SLUG, page);
+    if (!items.length) { console.log(`  Trang ${page}: không có dữ liệu, dừng quét.`); break; }
+    for (const it of items) {
+      scanned++;
+      const key1 = normalizeStr(it.name) + "|" + (it.year || "");
+      const key2 = it.origin_name ? normalizeStr(it.origin_name) + "|" + (it.year || "") : null;
+      if (existing.has(key1) || (key2 && existing.has(key2))) { skippedDup++; continue; }
+      try {
+        const { movie, episodes } = await vpDetail(it.slug);
+        if (!movie) { failed++; await sleep(200); continue; }
+        movie._episodes = episodes;
+        const payload = buildNewMovieFromVP(movie);
+        console.log(`  + Phim mới: ${payload.title} (${payload.type}, ${movie.year || "?"})`);
+        if (await insertMovie(payload)) {
+          added++;
+          existing.add(normalizeStr(payload.title) + "|" + (payload.year || ""));
+        } else failed++;
+      } catch (e) {
+        console.warn(`  Lỗi khi thêm "${it.name}":`, e.message);
+        failed++;
+      }
+      await sleep(300);
+    }
+  }
+  console.log(`Auto-add (${AUTO_ADD_COUNTRY_SLUG}): quét ${scanned}, thêm mới ${added}, trùng bỏ qua ${skippedDup}, lỗi ${failed}.`);
 }
 
 // ---------- main ----------
 async function main() {
   console.log(`Bắt đầu sync${DRY_RUN ? " (DRY RUN)" : ""} — ${new Date().toISOString()}`);
+
+  if (!SKIP_AUTO_ADD) {
+    try {
+      await autoAddNewMoviesByCountry();
+    } catch (e) {
+      console.error("Lỗi khi tự thêm phim mới:", e.message);
+    }
+  }
+
   const targets = await loadSeries();
   console.log(`Có ${targets.length} phim bộ đang chiếu cần kiểm tra.`);
 
@@ -491,8 +802,10 @@ async function main() {
           const embedEps = serverData.map((ep, i) => ({ name: ep.name || "Tập " + (i + 1), link: ep.link_embed || "" }));
           const kk = await getKKFullData(m);
           const link2Eps = embedEps.map((_, i) => kk.serverData[i]?.link_embed || "");
+          console.log(`  SV2 (KKPhim): ${kk.movie ? `khớp phim, điền ${link2Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên KKPhim"}`);
           const vp = await getVPFullData(m);
           const link3Eps = embedEps.map((_, i) => vp.serverData[i]?.link_embed || "");
+          console.log(`  SV3 (VodPhim): ${vp.movie ? `khớp phim, điền ${link3Eps.filter(Boolean).length}/${embedEps.length} tập` : "không tìm thấy trên VodPhim"}`);
           result = buildUpdate(m, {
             embedEps, link2Eps, link3Eps,
             curEpText: movie.episode_current,
@@ -526,6 +839,14 @@ async function main() {
 
   await pushNotifs(notifs);
   console.log(`Xong! Cập nhật ${success} phim, ${notifs.length} phim có tập mới, ${notFound} chưa có link, ${failed} lỗi.`);
+
+  if (!SKIP_BACKFILL_SV) {
+    try {
+      await backfillMissingSV();
+    } catch (e) {
+      console.error("Lỗi khi backfill SV2/SV3 cho phim đã hoàn thành:", e.message);
+    }
+  }
 
   if (!SKIP_POSTER_FIX) {
     try {
