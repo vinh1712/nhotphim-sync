@@ -240,6 +240,7 @@ async function kkDetail(slug) {
         // Lưu ý: field "poster_url" của KKPhim mới thật sự là ảnh poster (dọc),
         // còn "thumb_url" của họ là ảnh backdrop/thumb (ngang) — ưu tiên poster_url trước.
         thumb_url: d.movie.poster_url || d.movie.thumb_url || "",
+        country: d.movie.country || [],
         episode_current: d.movie.episode_current || "",
         episode_total: parseInt(d.movie.episode_total) || 0,
       },
@@ -255,6 +256,26 @@ async function kkDetail(slug) {
     return { movie: null, episodes: [] };
   }
 }
+// Chỉ nhận kết quả search KHỚP ĐÚNG TÊN (tên hoặc tên gốc) — tuyệt đối không lấy
+// đại items[0] khi không khớp, vì tên chung chung (vd "Lời Nói Dối Hoàn Hảo") rất
+// dễ trùng với phim khác hẳn (khác quốc gia, khác nội dung) trên KKPhim/VodPhim.
+function pickBestMatch(items, m) {
+  const q1 = normalizeStr((m.titleen || m.title || "").trim());
+  const q2 = normalizeStr((m.title || "").trim());
+  return items.find((it) => {
+    const n = normalizeStr(it.name || "");
+    const o = normalizeStr(it.origin_name || "");
+    return (q1 && (n === q1 || o === q1)) || (q2 && (n === q2 || o === q2));
+  }) || null;
+}
+// Kiểm tra quốc gia phim tìm được trên nguồn có khớp với quốc gia đã lưu trong DB
+// không (nếu cả 2 bên đều có thông tin) — bắt được trường hợp trùng tên nhưng
+// khác quốc gia (remake) mà vẫn lọt qua bước khớp tên ở trên.
+function countryMatches(dbCountryCode, sourceCountryArr) {
+  if (!dbCountryCode) return true; // DB chưa rõ quốc gia → không chặn
+  if (!sourceCountryArr || !sourceCountryArr.length) return true; // nguồn không có info → không chặn
+  return sourceCountryArr.some((c) => COUNTRY_IMPORT_MAP[(c.name || "").toLowerCase()] === dbCountryCode);
+}
 async function getKKFullData(m) {
   const titleEn = (m.titleen || "").trim();
   const titleVi = (m.title || "").trim();
@@ -263,8 +284,14 @@ async function getKKFullData(m) {
   let items = await kkSearch(title);
   if (!items.length && titleVi && titleVi !== title) items = await kkSearch(titleVi);
   if (!items.length) return { movie: null, serverData: [] };
-  const detail = await kkDetail(items[0].slug);
+  const pick = pickBestMatch(items, m);
+  if (!pick) { console.warn(`  KKPhim: có kết quả tìm kiếm nhưng không khớp đúng tên "${title}" → bỏ qua, tránh gắn nhầm phim`); return { movie: null, serverData: [] }; }
+  const detail = await kkDetail(pick.slug);
   if (!detail.movie) return { movie: null, serverData: [] };
+  if (!countryMatches(m.country, detail.movie.country)) {
+    console.warn(`  KKPhim: tên khớp nhưng QUỐC GIA không khớp (phim "${detail.movie.name}") → bỏ qua, tránh nhầm phim remake`);
+    return { movie: null, serverData: [] };
+  }
   return { movie: detail.movie, serverData: pickVietsubServerData(detail.episodes) };
 }
 
@@ -352,10 +379,14 @@ async function getVPFullData(m) {
   let items = await vpSearch(title);
   if (!items.length && titleVi && titleVi !== title) items = await vpSearch(titleVi);
   if (!items.length) return { movie: null, serverData: [] };
-  const q = normalizeStr(title);
-  const pick = items.find((it) => normalizeStr(it.name) === q || normalizeStr(it.origin_name) === q) || items[0];
+  const pick = pickBestMatch(items, m);
+  if (!pick) { console.warn(`  VodPhim: có kết quả tìm kiếm nhưng không khớp đúng tên "${title}" → bỏ qua, tránh gắn nhầm phim`); return { movie: null, serverData: [] }; }
   const detail = await vpDetail(pick.slug);
   if (!detail.movie) return { movie: null, serverData: [] };
+  if (!countryMatches(m.country, detail.movie.country)) {
+    console.warn(`  VodPhim: tên khớp nhưng QUỐC GIA không khớp (phim "${detail.movie.name}") → bỏ qua, tránh nhầm phim remake`);
+    return { movie: null, serverData: [] };
+  }
   return { movie: detail.movie, serverData: pickVietsubServerData(detail.episodes) };
 }
 
@@ -383,7 +414,7 @@ const SB_HEADERS = {
 };
 
 async function loadSeries() {
-  const cols = "id,title,titleen,year,type,ep,poster,episodes,totalep,currentep,epstatus,ophim_slug";
+  const cols = "id,title,titleen,year,type,ep,poster,episodes,totalep,currentep,epstatus,ophim_slug,country";
   const PAGE = 500;
   const out = [];
   for (let offset = 0; ; offset += PAGE) {
@@ -403,7 +434,7 @@ async function loadSeries() {
 // bao giờ quét lại các phim này vì chúng đã "Hoàn thành" — nên cần vòng riêng.
 // (Phim lẻ "type=movie" không dùng mảng episodes[] nên không nằm trong phạm vi này.)
 async function loadMissingSVTargets() {
-  const cols = "id,title,titleen,year,type,episodes,epstatus";
+  const cols = "id,title,titleen,year,type,episodes,epstatus,country";
   const PAGE = 500;
   const out = [];
   for (let offset = 0; ; offset += PAGE) {
@@ -515,7 +546,7 @@ async function syncFromKKOnly(m) {
 
 // ---------- Sửa ảnh poster bị lỗi ----------
 async function loadAllMoviesForPosterCheck() {
-  const cols = "id,title,titleen,year,poster,ophim_slug";
+  const cols = "id,title,titleen,year,poster,ophim_slug,country";
   const PAGE = 500;
   const out = [];
   for (let offset = 0; ; offset += PAGE) {
@@ -565,20 +596,24 @@ async function findReplacementPoster(m) {
   const title = (m.titleen || m.title || "").trim();
   if (!title) return "";
 
-  // KKPhim và VodPhim thử trước — NguonC để cuối cùng vì hay bị chặn bot, ít khi dùng được
+  // KKPhim và VodPhim thử trước — NguonC để cuối cùng vì hay bị chặn bot, ít khi dùng được.
+  // Chỉ lấy ảnh khi khớp ĐÚNG TÊN và ĐÚNG QUỐC GIA — tránh lấy nhầm poster của
+  // phim trùng tên khác quốc gia (remake).
   try {
     const items = await kkSearch(title);
-    if (items.length) {
-      const { movie } = await kkDetail(items[0].slug);
-      if (movie?.thumb_url) return movie.thumb_url;
+    const pick = pickBestMatch(items, m);
+    if (pick) {
+      const { movie } = await kkDetail(pick.slug);
+      if (movie?.thumb_url && countryMatches(m.country, movie.country)) return movie.thumb_url;
     }
   } catch {}
 
   try {
     const items = await vpSearch(title);
-    if (items.length) {
-      const { movie } = await vpDetail(items[0].slug);
-      if (movie?.thumb_url) return movie.thumb_url;
+    const pick = pickBestMatch(items, m);
+    if (pick) {
+      const { movie } = await vpDetail(pick.slug);
+      if (movie?.thumb_url && countryMatches(m.country, movie.country)) return movie.thumb_url;
     }
   } catch {}
 
