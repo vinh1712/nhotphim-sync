@@ -161,14 +161,33 @@ function pickVietsubServerData(eps) {
   for (const sv of pool) if ((sv.server_data || []).length > (best.server_data || []).length) best = sv;
   return best?.server_data || [];
 }
+// Key tập: theo SỐ TẬP (vd "Tập 5" / "Tập 05" / "5" -> "n5"); tên không có số
+// thì theo tên đã chuẩn hóa. Dùng để khớp tập giữa2 nguồn khác nhau về cách đặt tên.
+function epKey(name) {
+  const n = extractEpNum(name);
+  return n > 0 ? "n" + n : "s" + String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+// Gộp tập MỚI vào tập CŨ mà KHÔNG BAO GIỜ làm mất dữ liệu đã lưu:
+//   - khớp theo key (số tập / tên) thay vì tên y hệt (nguồn đổi cách đặt tên là mất link SV1)
+//   - giữ nguyên link (SV1) cũ, chỉ điền link2/link3 khi ô đang trống
+//   - tập cũ có link mà nguồn không trả về (cache/ít tập hơn) vẫn được GIỮ LẠI
+//   - giữ thêm các field phụ (m3u8, thumb, quality...) nếu có
 function mergeEpisodes(oldEps, newEps, newLink2List, newLink3List) {
-  const oldMap = {};
-  (oldEps || []).forEach((e) => { if (e && e.name) oldMap[e.name] = e; });
-  return newEps.map((e, i) => {
-    const old = oldMap[e.name] || {};
+  const oldByName = {}, oldByKey = {};
+  (oldEps || []).forEach((e) => {
+    if (!e || !e.name) return;
+    oldByName[e.name] = e;
+    const k = epKey(e.name);
+    if (!oldByKey[k]) oldByKey[k] = e;
+  });
+  const used = new Set();
+  const merged = (newEps || []).map((e, i) => {
+    const old = oldByName[e.name] || oldByKey[epKey(e.name)] || {};
+    used.add(epKey(e.name));
     const auto2 = newLink2List && newLink2List[i] ? newLink2List[i] : "";
     const auto3 = newLink3List && newLink3List[i] ? newLink3List[i] : "";
     return {
+      ...old,
       name: e.name,
       link: e.link || old.link || "",
       // Giữ link cũ nếu đã có; chỉ tự điền link mới khi ô đang trống —
@@ -178,6 +197,16 @@ function mergeEpisodes(oldEps, newEps, newLink2List, newLink3List) {
       link3: old.link3 || auto3 || "",
     };
   });
+  // Nguồn trả thiếu tập (cache cũ/chưa cập nhật) -> KHÔNG làm mất tập cũ đã có link
+  (oldEps || []).forEach((e) => {
+    if (!e || !e.name || used.has(epKey(e.name))) return;
+    if (e.link || e.link2 || e.link3) { merged.push({ ...e }); used.add(epKey(e.name)); }
+  });
+  // Sắp xếp theo số tập nếu tất cả đều có số
+  if (merged.length && merged.every((x) => extractEpNum(x.name) > 0)) {
+    merged.sort((a, b) => extractEpNum(a.name) - extractEpNum(b.name));
+  }
+  return merged;
 }
 
 // ---------- NguonC ----------
