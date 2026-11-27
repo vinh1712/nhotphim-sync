@@ -15,7 +15,7 @@ on:
         type: boolean
         default: false
 
-# Không để auto-sync chồng với sync tay (sync-episodes.yml).
+# Chỉ có 1 workflow sync nên không cho chạy chồng chính nó.
 concurrency:
   group: nhotphim-sync
   cancel-in-progress: false
