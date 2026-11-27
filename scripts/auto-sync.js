@@ -139,7 +139,10 @@ const asExisting = (m) => ({
 
 function countryCodes(list) {
   const out = new Set();
-  (list || []).forEach((c) => {
+  // Đa số API trả mảng, nhưng có nguồn trả string ("Hàn Quốc" / "kr") —
+  // nếu không chuẩn hóa ở đây thì .forEach() sẽ throw và làm cả lượt sync chết.
+  const arr = Array.isArray(list) ? list : typeof list === "string" ? list.split(",") : [];
+  arr.forEach((c) => {
     if (!c) return;
     const v = COUNTRY_IMPORT_MAP[String(typeof c === "string" ? c : (c.name || c.slug || "")).toLowerCase()];
     if (v) out.add(v);
@@ -265,7 +268,8 @@ const DETAILERS = { nc: detailNC, kk: detailKK, vp: detailVP };
 
 // ---------- Thêm phim mới ----------
 function isKorean(country) {
-  return countryCodes(country).has("kr") || (country || []).some((c) => {
+  const arr = Array.isArray(country) ? country : typeof country === "string" ? [country] : [];
+  return countryCodes(arr).has("kr") || arr.some((c) => {
     const n = S.normalizeStr(String(typeof c === "string" ? c : (c.name || c.slug || "")));
     return n.includes("han quoc") || n.includes("han-quoc");
   });
@@ -320,7 +324,8 @@ async function addNewMovies(candidates, state, movies) {
   if (!candidates.length) return 0;
   const order = ["nc", "kk", "vp"];
   const pref = order[(order.indexOf(state.lastSrc || "") + 1 + order.length) % order.length];
-  state.lastSrc = pref; // xoay vòng dù lượt này không thêm được -> cả 3 nguồn đều có lượt
+  // DRY_RUN không ghi DB nên không được làm xoay nguồn trong state.
+  if (!DRY_RUN) state.lastSrc = pref; // xoay vòng dù lượt này không thêm được -> cả 3 nguồn đều có lượt
   const ordered = candidates.slice().sort((a, b) => (a.src === pref ? -1 : 0) - (b.src === pref ? -1 : 0));
   const existing = movies.map(asExisting);
   let added = 0, checked = 0;
@@ -343,7 +348,7 @@ async function addNewMovies(candidates, state, movies) {
       if (!payload.title) continue;
       if (await insertMovie(payload)) {
         added++;
-        console.log(`  + Phim mới [${it.src}]: ${payload.title} (${payload.year})`);
+        console.log(`  ${DRY_RUN ? "[DRY_RUN] sẽ thêm" : "+"} Phim mới [${it.src}]: ${payload.title} (${payload.year})`);
       }
     } catch (e) {
       console.warn(`  Lỗi thêm phim [${it.src}/${it.slug}]: ${e.message}`);
@@ -372,7 +377,10 @@ async function main() {
       const prev = bucket[it.slug];
       bucket[it.slug] = it.modified;
       // Lần đầu chỉ ghi mốc — không import cả danh sách "mới cập nhật".
-      if (!firstRun && prev && prev !== it.modified) changed.push(it);
+      // Lần sau: mốc ĐỔI hoặc SLUG MỚI xuất hiện trên page 1 đều đưa vào xét.
+      // Trước đây chỉ xét khi có `prev`, nên phim mới lần đầu bị bỏ qua và
+      // không bao giờ được thêm nếu nó không đổi mốc lần nữa.
+      if (!firstRun && (!prev || prev !== it.modified)) changed.push(it);
     });
   });
 
@@ -382,40 +390,48 @@ async function main() {
     return;
   }
 
-  const movies = await loadMoviesLite();
-  const targets = [], newCandidates = [], seen = new Set();
-  changed.forEach((it) => {
-    const m = findMovie(it, movies);
-    if (!m) { newCandidates.push(it); return; }
-    if (seen.has(m.id)) return;
-    seen.add(m.id);
-    targets.push(m);
-  });
-  console.log(`Đổi ${changed.length} mốc → ${targets.length} phim có trong DB, ${newCandidates.length} ứng viên mới.`);
+  try {
+    const movies = await loadMoviesLite();
+    const targets = [], newCandidates = [], seen = new Set();
+    changed.forEach((it) => {
+      const m = findMovie(it, movies);
+      if (!m) { newCandidates.push(it); return; }
+      if (seen.has(m.id)) return;
+      seen.add(m.id);
+      targets.push(m);
+    });
+    console.log(`Đổi ${changed.length} mốc → ${targets.length} phim có trong DB, ${newCandidates.length} ứng viên mới.`);
 
-  const notifs = [];
-  if (targets.length) {
-    const epsMap = await loadEpisodesByIds(targets.map((m) => m.id));
-    for (const m of targets.slice(0, MAX_SYNC_MOVIES)) {
-      try {
-        const full = { ...m, episodes: epsMap.get(m.id) || "" };
-        const result = await syncFromKKOnly(full);
-        if (!result) continue;
-        if (await patchMovie(m.id, result.fields) && result.hasNewEp) {
-          console.log(`  ✓ Tập mới: ${m.title} ${m.currentep || 0} → ${result.curNum}`);
-          notifs.push({ title: m.title, ep: result.ep, poster: m.poster || "", created_at: new Date().toISOString() });
+    const notifs = [];
+    let synced = 0;
+    if (targets.length) {
+      const epsMap = await loadEpisodesByIds(targets.map((m) => m.id));
+      for (const m of targets.slice(0, MAX_SYNC_MOVIES)) {
+        try {
+          const full = { ...m, episodes: epsMap.get(m.id) || "" };
+          const result = await syncFromKKOnly(full);
+          if (!result) continue;
+          if (await patchMovie(m.id, result.fields)) {
+            synced++;
+            if (result.hasNewEp) {
+              console.log(`  ✓ Tập mới: ${m.title} ${m.currentep || 0} → ${result.curNum}`);
+              notifs.push({ title: m.title, ep: result.ep, poster: m.poster || "", created_at: new Date().toISOString() });
+            }
+          }
+        } catch (e) {
+          console.warn(`  Lỗi sync ${m.title}: ${e.message}`);
         }
-      } catch (e) {
-        console.warn(`  Lỗi sync ${m.title}: ${e.message}`);
+        await sleep(300);
       }
-      await sleep(300);
+      await pushNotifs(notifs);
     }
-    await pushNotifs(notifs);
-  }
 
-  const added = await addNewMovies(newCandidates, state, movies);
-  await saveState(state);
-  console.log(`Xong! Sync ${Math.min(targets.length, MAX_SYNC_MOVIES)} phim, ${notifs.length} tập mới, thêm ${added} phim mới.`);
+    const added = await addNewMovies(newCandidates, state, movies);
+    console.log(`Xong! Đã sync ${synced}/${Math.min(targets.length, MAX_SYNC_MOVIES)} phim, ${notifs.length} tập mới, ${DRY_RUN ? "sẽ thêm" : "thêm"} ${added} phim mới.`);
+  } finally {
+    // Luôn lưu mốc đã đọc, kể cả khi sync lỗi giữa chừng → lần sau không xử lý lại cả danh sách.
+    await saveState(state);
+  }
 }
 
 if (require.main === module) {
