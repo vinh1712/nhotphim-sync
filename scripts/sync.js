@@ -126,6 +126,44 @@ function extractEpNum(str) {
   const m = String(str || "").match(/\d+/);
   return m ? parseInt(m[0]) : 0;
 }
+function isNguoncUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === "nguonc.com" || host.endsWith(".nguonc.com");
+  } catch {
+    return false;
+  }
+}
+
+async function rpcCall(name, body) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/${name}`, {
+    method: "POST",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`RPC ${name} ${r.status}: ${text.slice(0, 180)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+// GitHub runner bị Cloudflare chặn (403). Gọi lại qua pg_net trên Supabase —
+// chỉ setup khi chạy supabase/nc_proxy.sql; nếu chưa có RPC thì lỗi sẽ rõ ràng.
+async function fetchJsonViaSupabase(url) {
+  const id = await rpcCall("nc_http_request", { p_url: url });
+  if (!id) throw new Error("nc_http_request không trả request_id");
+  for (let i = 0; i < 3; i++) {
+    const rows = await rpcCall("nc_http_result", { p_id: id });
+    const row = Array.isArray(rows) ? rows[0] : rows;
+    if (row && row.status_code) {
+      if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
+      return JSON.parse(row.content);
+    }
+    if (row && row.error_msg) throw new Error(row.error_msg);
+    await sleep(500);
+  }
+  throw new Error("Supabase proxy timeout");
+}
+
 async function fetchJson(url, ms = 15000, referer = "") {
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -144,6 +182,14 @@ async function fetchJson(url, ms = 15000, referer = "") {
       await sleep(1500 * attempt);
     } finally {
       clearTimeout(t);
+    }
+  }
+  if (isNguoncUrl(url) && /HTTP 403/.test(lastErr?.message || "")) {
+    try {
+      console.warn("[nc] Cloudflare chặn runner, thử qua Supabase proxy…");
+      return await fetchJsonViaSupabase(url);
+    } catch (e) {
+      lastErr = new Error(`${lastErr.message}; Supabase proxy: ${e.message}`);
     }
   }
   throw lastErr;
