@@ -28,12 +28,14 @@ try {
     "Origin"          = "https://phim.nguonc.com"
   }
 
-  # -UseBasicParsing bắt buộc trên Windows PowerShell 5.1 chạy non-interactive,
-  # nếu không IE engine sẽ hiện prompt thiết lập và throw ngay ở đây.
-  $resp = Invoke-WebRequest -Uri "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1" -Headers $headers -TimeoutSec 30 -UseBasicParsing
-  if ($resp.StatusCode -ne 200) { throw "HTTP $($resp.StatusCode)" }
+  # -UseBasicParsing bắt buộc trên Windows PowerShell 5.1 chạy non-interactive.
+  # Ghi ra file rồi đọc lại bằng UTF-8: PS 5.1 tự đo charset sai, làm tên phim
+  # bị mojibake ("Cá»™ng...") -> findNcSlugFromCache khớp tên không được.
+  $tmpList = Join-Path $env:TEMP "nhotphim-nc-list.json"
+  Invoke-WebRequest -Uri "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1" -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpList
+  if (-not (Test-Path -LiteralPath $tmpList)) { throw "Không tải được danh sách NguonC" }
 
-  $data = $resp.Content | ConvertFrom-Json
+  $data = [IO.File]::ReadAllText($tmpList, [Text.Encoding]::UTF8) | ConvertFrom-Json
   $items = @($data.items)
   if (-not $items.Count) { throw "Không có items" }
 
@@ -46,9 +48,10 @@ try {
 
     $detailUrl = "https://phim.nguonc.com/api/film/" + [uri]::EscapeDataString($slug)
     try {
-      $dresp = Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing
-      if ($dresp.StatusCode -ne 200) { throw "HTTP $($dresp.StatusCode)" }
-      $dj = $dresp.Content | ConvertFrom-Json
+      $tmpDetail = Join-Path $env:TEMP "nhotphim-nc-detail.json"
+      Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpDetail
+      if (-not (Test-Path -LiteralPath $tmpDetail)) { throw "Không tải được detail $slug" }
+      $dj = [IO.File]::ReadAllText($tmpDetail, [Text.Encoding]::UTF8) | ConvertFrom-Json
       if ($dj -and $dj.movie) {
         $details[$slug] = $dj
         $okDetail++
