@@ -95,8 +95,7 @@ function modTime(it) {
   return String((m && (m.time || m.at)) || m || (it && it.created) || "");
 }
 
-async function fetchLatest(cfg) {
-  const d = await fetchJson(cfg.url, 15000, cfg.referer);
+function mapLatest(cfg, d) {
   const list = (d && (d.items || (d.data && d.data.items))) || [];
   return list.slice(0, 30).map((it) => ({
     src: cfg.src,
@@ -107,6 +106,27 @@ async function fetchLatest(cfg) {
     year: it.year || "",
     country: it.country || it.country_name || [],
   })).filter((it) => it.slug && it.modified);
+}
+
+async function fetchLatest(cfg) {
+  // NguonC chặn IP GitHub runner. Máy nhà fetch rồi đẩy JSON lên nhánh nc-cache,
+  // workflow tải về file này; vẫn tự gọi trực tiếp nếu cache cũ/không có.
+  if (cfg.src === "nc" && process.env.NGUONC_LIST_FILE) {
+    try {
+      const fs = require("fs");
+      const d = JSON.parse(fs.readFileSync(process.env.NGUONC_LIST_FILE, "utf8"));
+      const at = d._fetched_at ? Date.parse(d._fetched_at) : NaN;
+      const ageMs = Date.now() - at;
+      if (!Number.isFinite(ageMs) || ageMs > 45 * 60 * 1000) {
+        throw new Error(`cache cũ (${Math.round(ageMs / 60000)} phút)`);
+      }
+      console.log(`[nc] dùng cache local (${Math.round(ageMs / 60000)} phút trước)`);
+      return mapLatest(cfg, d);
+    } catch (e) {
+      console.warn(`[nc] cache không dùng được (${e.message}), gọi trực tiếp…`);
+    }
+  }
+  return mapLatest(cfg, await fetchJson(cfg.url, 15000, cfg.referer));
 }
 
 // ---------- So khớp phim đã có trong DB ----------

@@ -29,9 +29,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      # NguonC chặn IP runner. Máy nhà quét rồi đẩy JSON lên nhánh nc-cache;
+      # workflow chỉ tải file nhỏ này (~20KB) thay vì gọi API NguonC.
+      - name: Lấy cache danh sách NguonC
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        run: |
+          gh api "repos/${{ github.repository }}/contents/nc-latest.json?ref=nc-cache" \
+            --jq .content | base64 -d > nc-latest.json
+          echo "cache bytes: $(wc -c < nc-latest.json)"
       - name: Chạy auto-sync
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          NGUONC_LIST_FILE: nc-latest.json
         run: node scripts/auto-sync.js
