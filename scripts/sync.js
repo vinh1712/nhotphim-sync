@@ -306,7 +306,14 @@ function normalizeNcDetail(d, slug = "") {
   // và vẫn lấy max để tránh ghi "Tập 12/7" khi nguồn khai báo thiếu.
   const maxServerEps = servers.reduce((mx, sv) => Math.max(mx, sv.server_data.length), 0);
   const declaredTotal = parseInt(m.total_episodes || m.episode_total) || 0;
-  const total = Math.max(declaredTotal, maxServerEps);
+  // Nguồn đôi khi ghi total_episodes lệch với chính current_episode
+  // ("Hoàn tất (12/12)" nhưng total_episodes=14). Khi current có dạng X/Y và báo
+  // đã hoàn tất thì Y là con số nguồn tự khai báo ngay cạnh trạng thái — tin Y.
+  const curText = String(m.current_episode || "");
+  const pair = curText.match(/(\d+)\s*\/\s*(\d+)/);
+  const pairTotal = pair ? parseInt(pair[2]) || 0 : 0;
+  const sourceTotal = /hoàn|full/i.test(curText) && pairTotal ? pairTotal : declaredTotal;
+  const total = Math.max(sourceTotal, maxServerEps);
   return {
     movie: {
       name: m.name || "",
@@ -674,8 +681,14 @@ function buildAllSourcesUpdate(m, sources) {
   const maxNum = episodes.reduce((mx, e) => Math.max(mx, extractEpNum(e.name) || 0), 0);
   const curText = (leader.movie && leader.movie.episode_current) || "";
   const curNum = Math.max(extractEpNum(curText) || 0, leader.len, maxNum);
+  const declaredTotal = parseInt(leader.movie && leader.movie.episode_total) || 0;
+  // KKPhim có phim ghi episode_total=14 nhưng current="Hoàn Tất (12/12)" và chỉ có
+  // 12 tập. Khi current báo hoàn tất kèm X/Y thì Y đáng tin hơn episode_total.
+  const pair = String(curText).match(/(\d+)\s*\/\s*(\d+)/);
+  const pairTotal = pair ? parseInt(pair[2]) || 0 : 0;
+  const sourceTotal = /hoàn|full/i.test(curText) && pairTotal ? pairTotal : declaredTotal;
   const totalEp = Math.max(
-    parseInt(leader.movie && leader.movie.episode_total) || 0,
+    sourceTotal,
     leader.len,
     maxNum
   );
