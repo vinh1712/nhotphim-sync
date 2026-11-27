@@ -152,7 +152,7 @@ async function fetchJsonViaSupabase(url) {
   let lastErr;
   // Cloudflare đôi khi chặn cả IP Supabase -> pg_net treo đến 15s rồi ghi error_msg.
   // Thử lại vài lượt với request_id MỚI; lượt nào cũng có xác suất qua được.
-  for (let round = 1; round <= 4; round++) {
+  for (let round = 1; round <= 2; round++) {
     let id;
     try {
       id = await rpcCall("nc_http_request", { p_url: url });
