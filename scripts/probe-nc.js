@@ -15,12 +15,11 @@ const H = {
 const API = "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1";
 const enc = encodeURIComponent(API);
 
+const TR = (u) => u.replace("https://phim.nguonc.com", "https://phim-nguonc-com.translate.goog") + (u.includes("?") ? "&" : "?") + "_x_tr_sl=vi&_x_tr_tl=en&_x_tr_hl=en";
 const TARGETS = [
   ["direct", API],
-  ["allorigins", `https://api.allorigins.win/raw?url=${enc}`],
-  ["microlink", `https://api.microlink.io/?url=${enc}&meta=false`],
-  ["cors-eu", `https://cors.eu.org/${API}`],
-  ["corslol", `https://api.cors.lol/?url=${enc}`],
+  ["translate", TR(API)],
+  ["trans-detail", TR("https://phim.nguonc.com/api/film/bao-chau")],
 ];
 
 function cfInfo(text) {
