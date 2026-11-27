@@ -274,11 +274,14 @@ function normalizeNcDetail(d, slug = "") {
   if (!m) return { movie: null, episodes: [], slug };
   const { genres, countries } = flattenNguonCCategory(m.category);
   const servers = normEpisodesNC(m.episodes);
-  // NguonC trả total_episodes = TỔNG item trên MỌI server (Vietsub + Thuyết minh
-  // trùng tập), nên dùng số tập của server dài nhất để làm totalep cho đúng
-  // lựa chọn "metadata theo server có nhiều tập nhất".
+  // total_episodes là tổng số tập do NguonC khai báo (có thể KHÁC số item đã đăng
+  // trên server, vd phim đang chiếu báo "Tập 9" nhưng tổng là 12). Metadata lấy theo
+  // server có nhiều tập nhất nghĩa là lấy field total của server đó, KHÔNG phải ép
+  // totalep = số item hiện có. Chỉ fallback về số item khi nguồn không khai báo,
+  // và vẫn lấy max để tránh ghi "Tập 12/7" khi nguồn khai báo thiếu.
   const maxServerEps = servers.reduce((mx, sv) => Math.max(mx, sv.server_data.length), 0);
-  const total = maxServerEps || parseInt(m.total_episodes || m.episode_total) || 0;
+  const declaredTotal = parseInt(m.total_episodes || m.episode_total) || 0;
+  const total = Math.max(declaredTotal, maxServerEps);
   return {
     movie: {
       name: m.name || "",
