@@ -3,7 +3,8 @@
 // Khác với scripts/sync.js (quét toàn bảng lúc 22h), script này chỉ:
 //   1. Đọc page 1 của danh sách "phim mới cập nhật" của NguonC / KKPhim / VodPhim.
 //   2. So mốc modified.time với mốc đã lưu ở bảng public.auto_sync_state.
-//   3. Phim đã có trong DB -> sync tiếp 3 nguồn bằng helper của sync.js (chỉ vài phim).
+//   3. Phim đã có trong DB -> sync 3 server RIÊNG BIỆT bằng helper của sync.js
+//      (NguonC -> link, KKPhim -> link2, VodPhim -> link3; không thay thế chéo).
 //   4. Phim chưa có -> thêm tối đa 1 phim Hàn Quốc (năm >= 2026) mỗi lượt, xoay vòng nguồn.
 //
 // Lần chạy đầu CHỈ ghi mốc (baseline), không import hàng loạt.
@@ -20,7 +21,8 @@ const S = require("./sync.js");
 const {
   SB_URL, SB_HEADERS, DRY_RUN,
   fetchJson, dedupKey, keysMatch, isDuplicateMovie, extractEpNum, pickVietsubServerData,
-  patchMovie, pushNotifs, syncFromKKOnly, insertMovie,
+  patchMovie, pushNotifs, syncFromAllSources, insertMovie,
+  setNcDetailCache, getNcDetail, normalizeNcDetail, parseExtra,
   GENRE_IMPORT_MAP, COUNTRY_IMPORT_MAP, sleep,
 } = S;
 
@@ -67,7 +69,7 @@ async function saveState(state) {
 
 // Chỉ lấy các cột cần thiết — KHÔNG select=* (episodes/extra có row rất nặng).
 async function loadMoviesLite() {
-  const cols = "id,title,titleen,year,type,ep,poster,country,epstatus,currentep,totalep,ophim_slug";
+  const cols = "id,title,titleen,year,type,ep,poster,country,epstatus,currentep,totalep,ophim_slug,extra";
   const out = [];
   const PAGE = 500;
   for (let offset = 0; ; offset += PAGE) {
@@ -90,9 +92,19 @@ async function loadEpisodesByIds(ids) {
 }
 
 // ---------- Danh sách "phim mới cập nhật" ----------
+function scalar(v) {
+  return v !== null && v !== undefined && typeof v !== "object" ? String(v) : "";
+}
+
 function modTime(it) {
   const m = it && it.modified;
-  return String((m && (m.time || m.at)) || m || (it && it.created) || "");
+  // modified của NguonC là string. Không được đọc m.at khi m là string —
+  // lúc đó m.at chính là String.prototype.at (một hàm), ghi vào state sẽ sai.
+  if (m && typeof m === "object") {
+    return scalar(m.time) || scalar(m.at)
+      || (typeof m.toISOString === "function" ? m.toISOString() : "");
+  }
+  return scalar(m) || scalar(it && it.created);
 }
 
 function mapLatest(cfg, d) {
@@ -120,9 +132,13 @@ async function fetchLatest(cfg) {
       if (!Number.isFinite(ageMs) || ageMs > 45 * 60 * 1000) {
         throw new Error(`cache cũ (${Math.round(ageMs / 60000)} phút)`);
       }
-      console.log(`[nc] dùng cache local (${Math.round(ageMs / 60000)} phút trước)`);
+      // detail đi kèm cache để sync SV1 mà không gọi NguonC trên runner.
+      setNcDetailCache(d.details || {}, d.items || []);
+      console.log(`[nc] dùng cache local (${Math.round(ageMs / 60000)} phút trước, ${Object.keys(d.details || {}).length} detail)`);
       return mapLatest(cfg, d);
     } catch (e) {
+      // Cache cũ/không đọc được thì KHÔNG được dùng detail cũ điền vào SV1.
+      setNcDetailCache({}, []);
       console.warn(`[nc] cache không dùng được (${e.message}), gọi trực tiếp…`);
     }
   }
@@ -136,6 +152,21 @@ const asExisting = (m) => ({
   titleEnKey: dedupKey(m.titleen || ""),
   year: parseInt(m.year) || 0,
 });
+
+// Gắn slug NguonC vừa thấy ở danh sách "mới cập nhật" vào bản copy của phim
+// trước khi sync — để SV1 được điền đúng dù DB chưa có ophim_slug/extra.
+function withNcSlug(m, slug) {
+  if (!slug) return m;
+  const extra = parseExtra(m.extra);
+  return {
+    ...m,
+    ophim_slug: m.ophim_slug || slug,
+    extra: {
+      ...extra,
+      sourceSlug: { ...(extra.sourceSlug || {}), nc: slug },
+    },
+  };
+}
 
 function countryCodes(list) {
   const out = new Set();
@@ -173,46 +204,12 @@ function findMovie(item, movies) {
 }
 
 // ---------- Detail 3 nguồn (đều trả về chuẩn: thumb_url=poster, poster_url=backdrop) ----------
-function flattenNguonCCategory(category) {
-  const genres = [], countries = [];
-  if (category && typeof category === "object") {
-    Object.values(category).forEach((g) => {
-      const group = String((g && g.group && g.group.name) || "").toLowerCase();
-      const list = (g && g.list) || [];
-      if (group.includes("the loai")) list.forEach((x) => genres.push({ name: x.name }));
-      else if (group.includes("quoc gia")) list.forEach((x) => countries.push({ name: x.name }));
-    });
-  }
-  return { genres, countries };
-}
-
-function normEpisodesNC(servers) {
-  return (servers || []).map((sv) => ({
-    server_name: sv.server_name || "Server #1",
-    server_data: (sv.items || sv.server_data || []).map((ep) => ({
-      name: ep.name || "", link_embed: ep.embed || ep.link_embed || "", link_m3u8: ep.m3u8 || ep.link_m3u8 || "",
-    })),
-  }));
-}
-
 async function detailNC(slug) {
   try {
-    const d = await fetchJson(`${NGUONC_BASE}/film/${slug}`, 15000, "https://phim.nguonc.com/");
-    const m = d && d.movie;
-    if (!m) return { movie: null, episodes: [] };
-    const { genres, countries } = flattenNguonCCategory(m.category);
-    return {
-      movie: {
-        name: m.name || "", origin_name: m.original_name || "", content: m.description || "",
-        year: m.year || "",
-        type: (parseInt(m.total_episodes || m.episode_total) || 0) > 1 ? "series" : "single",
-        thumb_url: m.thumb_url || m.poster_url || "", poster_url: m.poster_url || m.thumb_url || "",
-        backdrop_url: m.poster_url || m.thumb_url || "", category: genres,
-        country: countries.length ? countries : (m.country || []),
-        lang: m.language || "", episode_current: m.current_episode || "", episode_total: parseInt(m.total_episodes) || 0,
-      },
-      episodes: normEpisodesNC(m.episodes),
-    };
+    // Ưu tiên detail đã được máy nhà fetch sẵn trong nc-latest.json.
+    const d = getNcDetail(slug) || await fetchJson(`${NGUONC_BASE}/film/${encodeURIComponent(slug)}`, 15000, "https://phim.nguonc.com/");
+    const out = normalizeNcDetail(d, slug);
+    return out.movie ? out : { movie: null, episodes: [] };
   } catch (e) { console.warn(`  NC detail lỗi (${slug}): ${e.message}`); return { movie: null, episodes: [] }; }
 }
 
@@ -393,9 +390,12 @@ async function main() {
   try {
     const movies = await loadMoviesLite();
     const targets = [], newCandidates = [], seen = new Set();
+    const ncSlugByMovieId = new Map();
     changed.forEach((it) => {
       const m = findMovie(it, movies);
       if (!m) { newCandidates.push(it); return; }
+      // Nhớ slug NguonC của item vừa đổi để truyền vào sync (điền đúng SV1).
+      if (it.src === "nc" && it.slug) ncSlugByMovieId.set(m.id, it.slug);
       if (seen.has(m.id)) return;
       seen.add(m.id);
       targets.push(m);
@@ -408,8 +408,11 @@ async function main() {
       const epsMap = await loadEpisodesByIds(targets.map((m) => m.id));
       for (const m of targets.slice(0, MAX_SYNC_MOVIES)) {
         try {
-          const full = { ...m, episodes: epsMap.get(m.id) || "" };
-          const result = await syncFromKKOnly(full);
+          const full = withNcSlug(
+            { ...m, episodes: epsMap.get(m.id) || "" },
+            ncSlugByMovieId.get(m.id)
+          );
+          const result = await syncFromAllSources(full);
           if (!result) continue;
           if (await patchMovie(m.id, result.fields)) {
             synced++;
@@ -439,5 +442,5 @@ if (require.main === module) {
 }
 
 module.exports = {
-  modTime, findMovie, buildNewPayload, isKorean, countryCodes, fetchLatest, SOURCES,
+  modTime, findMovie, buildNewPayload, isKorean, countryCodes, fetchLatest, withNcSlug, SOURCES,
 };

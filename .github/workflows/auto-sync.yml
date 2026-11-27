@@ -29,9 +29,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      # NguonC chặn IP runner. Máy nhà quét rồi đẩy JSON lên nhánh nc-cache;
-      # workflow chỉ tải file nhỏ này (~20KB) thay vì gọi API NguonC.
-      - name: Lấy cache danh sách NguonC
+      # NguonC chặn IP runner. Máy nhà fetch danh sách + detail rồi đẩy JSON lên
+      # nhánh nc-cache; workflow chỉ tải file này thay vì gọi API NguonC.
+      - name: Lấy cache danh sách + chi tiết NguonC
         env:
           GH_TOKEN: ${{ github.token }}
         continue-on-error: true
