@@ -12,4 +12,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node scripts/probe-nc.js
+      - name: Probe HTTP từ runner
+        run: node scripts/probe-nc.js
+      - name: Probe Supabase RPC
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node scripts/probe-sb.js
