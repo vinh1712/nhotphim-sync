@@ -28,7 +28,9 @@ try {
     "Origin"          = "https://phim.nguonc.com"
   }
 
-  $resp = Invoke-WebRequest -Uri "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1" -Headers $headers -TimeoutSec 30
+  # -UseBasicParsing bắt buộc trên Windows PowerShell 5.1 chạy non-interactive,
+  # nếu không IE engine sẽ hiện prompt thiết lập và throw ngay ở đây.
+  $resp = Invoke-WebRequest -Uri "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1" -Headers $headers -TimeoutSec 30 -UseBasicParsing
   if ($resp.StatusCode -ne 200) { throw "HTTP $($resp.StatusCode)" }
 
   $data = $resp.Content | ConvertFrom-Json
@@ -44,7 +46,7 @@ try {
 
     $detailUrl = "https://phim.nguonc.com/api/film/" + [uri]::EscapeDataString($slug)
     try {
-      $dresp = Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30
+      $dresp = Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing
       if ($dresp.StatusCode -ne 200) { throw "HTTP $($dresp.StatusCode)" }
       $dj = $dresp.Content | ConvertFrom-Json
       if ($dj -and $dj.movie) {
@@ -102,6 +104,6 @@ try {
 
   Write-Log ("OK items={0} details={1} bytes={2}" -f $items.Count, $okDetail, $payload.Length)
 } catch {
-  Write-Log ("ERR " + $_.Exception.Message)
+  Write-Log ("ERR {0} (line {1})" -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber)
   exit 1
 }
