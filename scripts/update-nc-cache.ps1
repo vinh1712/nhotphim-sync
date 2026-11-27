@@ -45,22 +45,29 @@ try {
   # Tạo nhánh cache nếu chưa có (không đụng main).
   $branchCheck = Invoke-Gh @("api", "repos/$repo/branches/$branch", "--silent")
   if (-not $branchCheck.Ok) {
-    $mainSha = (Invoke-Gh @("api", "repos/$repo/git/ref/heads/main", "--jq", ".object.sha")).Out.Trim()
+    $mainOut = (Invoke-Gh @("api", "repos/$repo/git/ref/heads/main", "--jq", ".object.sha")).Out
+    $mainSha = $mainOut -split "`n" | Where-Object { $_ -match '^[0-9a-f]{40}$' } | Select-Object -First 1
     if (-not $mainSha) { throw "Không lấy được SHA của main" }
     $created = Invoke-Gh @("api", "--method", "POST", "repos/$repo/git/refs", "-f", "ref=refs/heads/$branch", "-f", "sha=$mainSha", "--silent")
     if (-not $created.Ok) { throw "Tạo nhánh $branch lỗi: $($created.Out)" }
   }
 
-  $existing = Invoke-Gh @("api", "repos/$repo/contents/$path?ref=$branch", "--jq", ".sha")
+  # PowerShell coi "$path?ref" là TÊN BIẾN, phải dùng ${} hoặc nối chuỗi.
+  $existingUrl = "repos/$repo/contents/${path}?ref=${branch}"
+  $existing = Invoke-Gh @("api", $existingUrl, "--jq", ".sha")
+  # Chỉ nhận đúng 40 hex — tránh lỗi "Invalid request" khi gh in thêm dòng stderr.
+  $existingSha = $existing.Out -split "`n" | Where-Object { $_ -match '^[0-9a-f]{40}$' } | Select-Object -First 1
   $ghArgs = @(
     "api", "--method", "PUT", "repos/$repo/contents/$path",
     "-f", "message=NC cache $((Get-Date).ToUniversalTime().ToString('o'))",
     "-f", "content=$b64",
     "-f", "branch=$branch"
   )
-  if ($existing.Ok -and $existing.Out.Trim()) { $ghArgs += @("-f", "sha=$($existing.Out.Trim())") }
+  if ($existingSha) { $ghArgs += @("-f", "sha=$existingSha") }
   $saved = Invoke-Gh $ghArgs
-  if (-not $saved.Ok) { throw "Ghi $path lên $branch lỗi: $($saved.Out)" }
+  if (-not $saved.Ok) {
+    throw "Ghi $path lên $branch lỗi: $($saved.Out)"
+  }
 
   Write-Log ("OK items={0} bytes={1}" -f @($data.items).Count, $payload.Length)
 } catch {
