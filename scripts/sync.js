@@ -149,27 +149,40 @@ async function rpcCall(name, body) {
 // GitHub runner bị Cloudflare chặn (403). Gọi lại qua pg_net trên Supabase —
 // chỉ setup khi chạy supabase/nc_proxy.sql; nếu chưa có RPC thì lỗi sẽ rõ ràng.
 async function fetchJsonViaSupabase(url) {
-  const id = await rpcCall("nc_http_request", { p_url: url });
-  if (!id) throw new Error("nc_http_request không trả request_id");
   let lastErr;
-  // nc_http_result() tự pg_sleep tới 15s nên dễ bị Supabase cắt bởi statement
-  // timeout (~10s, mã 57014). Response của pg_net vẫn được ghi vào
-  // net._http_response sau đó, nên gọi lại CHUNG request_id ở lượt sau là có.
-  for (let i = 0; i < 6; i++) {
+  // Cloudflare đôi khi chặn cả IP Supabase -> pg_net treo đến 15s rồi ghi error_msg.
+  // Thử lại vài lượt với request_id MỚI; lượt nào cũng có xác suất qua được.
+  for (let round = 1; round <= 4; round++) {
+    let id;
     try {
-      const rows = await rpcCall("nc_http_result", { p_id: id });
-      const row = Array.isArray(rows) ? rows[0] : rows;
-      if (row && row.status_code) {
-        if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
-        if (!row.content) throw new Error("Supabase proxy trả nội dung rỗng");
-        return JSON.parse(row.content);
+      id = await rpcCall("nc_http_request", { p_url: url });
+      if (!id) throw new Error("nc_http_request không trả request_id");
+      // nc_http_result() tự pg_sleep tới 15s nên dễ bị Supabase cắt bởi statement
+      // timeout (~10s, mã 57014). Response của pg_net vẫn được ghi vào
+      // net._http_response sau đó, nên gọi lại CHUNG request_id ở lượt sau là có.
+      for (let i = 0; i < 4; i++) {
+        try {
+          const rows = await rpcCall("nc_http_result", { p_id: id });
+          const row = Array.isArray(rows) ? rows[0] : rows;
+          if (row && row.status_code) {
+            if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
+            if (!row.content) throw new Error("Supabase proxy trả nội dung rỗng");
+            return JSON.parse(row.content);
+          }
+          if (row && row.error_msg) throw new Error(row.error_msg);
+        } catch (e) {
+          lastErr = e;
+          // 403 là chặn cố định, không thử lại; các lỗi timeout thì tiếp tục.
+          if (/HTTP 403/.test(e.message)) throw e;
+          if (!/57014|statement timeout|timeout/i.test(e.message)) throw e;
+        }
+        await sleep(500);
       }
-      if (row && row.error_msg) throw new Error(row.error_msg);
     } catch (e) {
       lastErr = e;
-      if (!/57014|statement timeout|timeout/i.test(e.message)) throw e;
+      if (/HTTP 403/.test(e.message)) break;
     }
-    await sleep(700);
+    await sleep(400);
   }
   throw lastErr || new Error("Supabase proxy timeout");
 }
