@@ -1,8 +1,10 @@
 name: Auto sync nhẹ (3 nguồn)
 
-# Chạy ngầm, không cần mở trang admin. Đặt 15 phút/lần (GitHub cho phép tối thiểu
-# 5 phút) để giảm số lượt chạy và egress. Mỗi lượt chỉ đọc page 1 "phim mới cập
+# Chạy ngầm, không cần mở trang admin. Mỗi lượt chỉ đọc page 1 "phim mới cập
 # nhật" của 3 nguồn, chỉ sync phim có mốc modified đổi và tối đa 1 phim mới.
+# GitHub `schedule` đang không sinh run nên lịch 15 phút thực tế do
+# scripts/trigger-dispatch.ps1 + Task Scheduler bắn workflow_dispatch. Cron ở
+# dưới giữ lại làm dự phòng, dùng phút lệch giờ để tránh cao tải.
 on:
   schedule:
     - cron: "7,22,37,52 * * * *"
