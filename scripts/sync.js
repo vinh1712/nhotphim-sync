@@ -151,17 +151,27 @@ async function rpcCall(name, body) {
 async function fetchJsonViaSupabase(url) {
   const id = await rpcCall("nc_http_request", { p_url: url });
   if (!id) throw new Error("nc_http_request không trả request_id");
-  for (let i = 0; i < 3; i++) {
-    const rows = await rpcCall("nc_http_result", { p_id: id });
-    const row = Array.isArray(rows) ? rows[0] : rows;
-    if (row && row.status_code) {
-      if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
-      return JSON.parse(row.content);
+  let lastErr;
+  // nc_http_result() tự pg_sleep tới 15s nên dễ bị Supabase cắt bởi statement
+  // timeout (~10s, mã 57014). Response của pg_net vẫn được ghi vào
+  // net._http_response sau đó, nên gọi lại CHUNG request_id ở lượt sau là có.
+  for (let i = 0; i < 6; i++) {
+    try {
+      const rows = await rpcCall("nc_http_result", { p_id: id });
+      const row = Array.isArray(rows) ? rows[0] : rows;
+      if (row && row.status_code) {
+        if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
+        if (!row.content) throw new Error("Supabase proxy trả nội dung rỗng");
+        return JSON.parse(row.content);
+      }
+      if (row && row.error_msg) throw new Error(row.error_msg);
+    } catch (e) {
+      lastErr = e;
+      if (!/57014|statement timeout|timeout/i.test(e.message)) throw e;
     }
-    if (row && row.error_msg) throw new Error(row.error_msg);
-    await sleep(500);
+    await sleep(700);
   }
-  throw new Error("Supabase proxy timeout");
+  throw lastErr || new Error("Supabase proxy timeout");
 }
 
 async function fetchJson(url, ms = 15000, referer = "") {
