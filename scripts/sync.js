@@ -76,7 +76,11 @@ function findNcSlugFromCache(m) {
   if (!m) return "";
   const extra = parseExtra(m.extra);
   const explicit = String(m.ophim_slug || (extra.sourceSlug && extra.sourceSlug.nc) || extra.ophim_slug || "");
-  if (explicit && NC_DETAIL_CACHE[explicit]) return explicit;
+  const explicitDetail = explicit ? NC_DETAIL_CACHE[explicit] : null;
+  if (explicitDetail) {
+    if (ncDetailMatches(m, explicitDetail.movie)) return explicit;
+    console.warn(`  NguonC: ophim_slug "${explicit}" là phim "${(explicitDetail.movie || {}).name}" KHÔNG khớp → bỏ, dò lại theo tên`);
+  }
 
   const q = normalizeStr(String(m.title || m.titleen || "").trim());
   const year = parseInt(m.year) || 0;
@@ -91,15 +95,14 @@ function findNcSlugFromCache(m) {
   });
   if (hit && hit.slug) return String(hit.slug);
 
-  // Detail cache đôi khi có nhiều slug hơn danh sách page 1.
+  // Detail cache đôi khi có nhiều slug hơn danh sách page 1. Chỉ nhận khi tên +
+  // năm trong detail khớp thật (không đoán theo slug).
   for (const [slug, d] of Object.entries(NC_DETAIL_CACHE)) {
-    const mv = d && d.movie;
-    if (!mv) continue;
-    const n = normalizeStr(String(mv.name || mv.original_name || "").trim());
-    if (q && n === q && yearOk(mv.year || mv.release_year)) return slug;
+    if (ncDetailMatches(m, d && d.movie)) return slug;
   }
-  // Vẫn trả slug cũ để thử fetch trực tiếp (trường hợp chạy ở máy nhà).
-  return explicit;
+  // Slug chưa có trong cache thì vẫn trả về để thử fetch trực tiếp (máy nhà);
+  // getNCFullData sẽ kiểm tra lại detail sau khi fetch.
+  return explicitDetail ? "" : explicit;
 }
 
 // Cho phép chạy sync.js thủ công với cùng file cache mà auto-sync dùng.
@@ -177,6 +180,28 @@ function keysMatch(a, b) {
   const longer = a.length <= b.length ? b : a;
   return shorter.length >= 6 && longer.includes(shorter);
 }
+// Khóa so khớp tên phim với detail nguồn: giữ cả số phần/mùa để "Phần 1" không
+// bị coi là "Phần 2", chỉ bỏ dấu/ký tự đặc biệt.
+function ncTitleKey(s) {
+  return normalizeStr(String(s || ""))
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+// Detail NguonC chỉ được dùng khi đúng phim: tên (Việt hoặc gốc) khớp hệt và năm
+// lệch tối đa 1. DB có nhiều row ophim_slug trỏ sai sang phim khác, nên phải kiểm
+// tra nội dung detail chứ không tin slug.
+function ncDetailMatches(m, mv) {
+  if (!m || !mv) return false;
+  const dbYear = parseInt(m.year) || 0;
+  const ncYear = parseInt(mv.year || mv.release_year) || 0;
+  if (dbYear && ncYear && Math.abs(dbYear - ncYear) > 1) return false;
+  const dbTitles = [m.title, m.titleen].map(ncTitleKey).filter(Boolean);
+  const ncTitles = [mv.name, mv.original_name].map(ncTitleKey).filter(Boolean);
+  return dbTitles.some((a) => ncTitles.some((b) => a === b));
+}
+
 function isDuplicateMovie(candTitle, candTitleEn, candYear, existingList) {
   const ct = dedupKey(candTitle);
   const ce = candTitleEn ? dedupKey(candTitleEn) : "";
@@ -508,6 +533,10 @@ async function getNCFullData(m) {
   if (!slug) return { movie: null, serverData: [], slug: "" };
   const detail = await nguoncDetail(slug);
   if (!detail.movie) return { movie: null, serverData: [], slug };
+  if (!ncDetailMatches(m, detail.movie)) {
+    console.warn(`  NguonC: slug "${slug}" trả phim "${detail.movie.name}" (${detail.movie.year}) KHÔNG khớp "${m.title}" (${m.year}) → bỏ qua`);
+    return { movie: null, serverData: [], slug };
+  }
   if (!countryMatches(m.country, detail.movie.country)) {
     console.warn(`  NguonC: tên khớp nhưng QUỐC GIA không khớp (phim "${detail.movie.name}") → bỏ qua`);
     return { movie: null, serverData: [], slug };

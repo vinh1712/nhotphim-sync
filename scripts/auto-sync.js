@@ -160,7 +160,9 @@ function withNcSlug(m, slug) {
   const extra = parseExtra(m.extra);
   return {
     ...m,
-    ophim_slug: m.ophim_slug || slug,
+    // Slug vừa thấy ở danh sách mới là nguồn đáng tin nhất — ưu tiên nó hơn
+    // ophim_slug cũ trong DB (có row bị lưu sai sang phim khác).
+    ophim_slug: slug || m.ophim_slug,
     extra: {
       ...extra,
       sourceSlug: { ...(extra.sourceSlug || {}), nc: slug },
