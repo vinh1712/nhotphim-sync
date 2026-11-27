@@ -193,67 +193,6 @@ function extractEpNum(str) {
   const m = String(str || "").match(/\d+/);
   return m ? parseInt(m[0]) : 0;
 }
-function isNguoncUrl(url) {
-  try {
-    const host = new URL(url).hostname;
-    return host === "nguonc.com" || host.endsWith(".nguonc.com");
-  } catch {
-    return false;
-  }
-}
-
-async function rpcCall(name, body) {
-  const r = await fetch(`${SB_URL}/rest/v1/rpc/${name}`, {
-    method: "POST",
-    headers: { ...SB_HEADERS, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`RPC ${name} ${r.status}: ${text.slice(0, 180)}`);
-  return text ? JSON.parse(text) : null;
-}
-
-// GitHub runner bị Cloudflare chặn (403). Gọi lại qua pg_net trên Supabase —
-// chỉ setup khi chạy supabase/nc_proxy.sql; nếu chưa có RPC thì lỗi sẽ rõ ràng.
-async function fetchJsonViaSupabase(url) {
-  let lastErr;
-  // Cloudflare đôi khi chặn cả IP Supabase -> pg_net treo đến 15s rồi ghi error_msg.
-  // Thử lại vài lượt với request_id MỚI; lượt nào cũng có xác suất qua được.
-  for (let round = 1; round <= 2; round++) {
-    let id;
-    try {
-      id = await rpcCall("nc_http_request", { p_url: url });
-      if (!id) throw new Error("nc_http_request không trả request_id");
-      // nc_http_result() tự pg_sleep tới 15s nên dễ bị Supabase cắt bởi statement
-      // timeout (~10s, mã 57014). Response của pg_net vẫn được ghi vào
-      // net._http_response sau đó, nên gọi lại CHUNG request_id ở lượt sau là có.
-      for (let i = 0; i < 4; i++) {
-        try {
-          const rows = await rpcCall("nc_http_result", { p_id: id });
-          const row = Array.isArray(rows) ? rows[0] : rows;
-          if (row && row.status_code) {
-            if (row.status_code !== 200) throw new Error(`HTTP ${row.status_code}`);
-            if (!row.content) throw new Error("Supabase proxy trả nội dung rỗng");
-            return JSON.parse(row.content);
-          }
-          if (row && row.error_msg) throw new Error(row.error_msg);
-        } catch (e) {
-          lastErr = e;
-          // 403 là chặn cố định, không thử lại; các lỗi timeout thì tiếp tục.
-          if (/HTTP 403/.test(e.message)) throw e;
-          if (!/57014|statement timeout|timeout/i.test(e.message)) throw e;
-        }
-        await sleep(500);
-      }
-    } catch (e) {
-      lastErr = e;
-      if (/HTTP 403/.test(e.message)) break;
-    }
-    await sleep(400);
-  }
-  throw lastErr || new Error("Supabase proxy timeout");
-}
-
 async function fetchJson(url, ms = 15000, referer = "") {
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -261,7 +200,8 @@ async function fetchJson(url, ms = 15000, referer = "") {
     const t = setTimeout(() => ctrl.abort(), ms);
     try {
       const headers = { ...BROWSER_HEADERS };
-      if (referer) { headers.Referer = referer; headers.Origin = referer.replace(/\/$/, ""); }
+      // Không gửi Origin: NguonC trả 502 cho một số slug khi có header này.
+      if (referer) { headers.Referer = referer; }
       const r = await fetch(url, { signal: ctrl.signal, headers });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return await r.json();
@@ -274,14 +214,8 @@ async function fetchJson(url, ms = 15000, referer = "") {
       clearTimeout(t);
     }
   }
-  if (isNguoncUrl(url) && /HTTP 403/.test(lastErr?.message || "")) {
-    try {
-      console.warn("[nc] Cloudflare chặn runner, thử qua Supabase proxy…");
-      return await fetchJsonViaSupabase(url);
-    } catch (e) {
-      lastErr = new Error(`${lastErr.message}; Supabase proxy: ${e.message}`);
-    }
-  }
+  // Không fallback qua RPC/Supabase proxy nữa: đã dùng cache nc-cache. Nếu cache
+  // thiếu thì bỏ qua server đó, không làm cả lượt sync chết/ chờ timeout.
   throw lastErr;
 }
 function pickVietsubServerData(eps) {

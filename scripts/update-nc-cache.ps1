@@ -25,7 +25,7 @@ try {
     "Accept"          = "application/json, text/plain, */*"
     "Accept-Language" = "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     "Referer"         = "https://phim.nguonc.com/"
-    "Origin"          = "https://phim.nguonc.com"
+    # Không gửi Origin: NguonC trả 502 cho một số slug khi có header này.
   }
 
   # -UseBasicParsing bắt buộc trên Windows PowerShell 5.1 chạy non-interactive.
@@ -47,19 +47,28 @@ try {
     if (-not $slug) { continue }
 
     $detailUrl = "https://phim.nguonc.com/api/film/" + [uri]::EscapeDataString($slug)
-    try {
-      $tmpDetail = Join-Path $env:TEMP "nhotphim-nc-detail.json"
-      Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpDetail
-      if (-not (Test-Path -LiteralPath $tmpDetail)) { throw "Không tải được detail $slug" }
-      $dj = [IO.File]::ReadAllText($tmpDetail, [Text.Encoding]::UTF8) | ConvertFrom-Json
-      if ($dj -and $dj.movie) {
+    $tmpDetail = Join-Path $env:TEMP "nhotphim-nc-detail.json"
+    $got = $false
+    # 502/timeout ở NguonC là tạm thời — thử lại vài lượt ngay trên máy nhà để
+    # cache đầy đủ, không để runner phải tự gọi (403 Cloudflare).
+    for ($attempt = 1; $attempt -le 3 -and -not $got; $attempt++) {
+      try {
+        if (Test-Path -LiteralPath $tmpDetail) { Remove-Item -LiteralPath $tmpDetail -Force }
+        Invoke-WebRequest -Uri $detailUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpDetail
+        if (-not (Test-Path -LiteralPath $tmpDetail)) { throw "Không tải được detail $slug" }
+        $dj = [IO.File]::ReadAllText($tmpDetail, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $dj -or -not $dj.movie) { throw "không có movie" }
         $details[$slug] = $dj
         $okDetail++
-      } else {
-        Write-Log ("WARN detail {0}: không có movie" -f $slug)
+        $got = $true
+      } catch {
+        $msg = $_.Exception.Message
+        if ($attempt -eq 3 -or $msg -match '404') {
+          Write-Log ("WARN detail {0}: {1}" -f $slug, $msg)
+        } else {
+          Start-Sleep -Milliseconds (800 * $attempt)
+        }
       }
-    } catch {
-      Write-Log ("WARN detail {0}: {1}" -f $slug, $_.Exception.Message)
     }
     Start-Sleep -Milliseconds 150
   }

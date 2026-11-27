@@ -1,3 +1,6 @@
+-- DEPRECATED: không còn dùng sau khi chuyển sang cache nc-cache (xem scripts/update-nc-cache.ps1).
+-- Giữ file này lại chỉ để tham khảo/phòng khi cần khôi phục cách cũ.
+--
 -- Proxy NguonC qua Supabase (chạy 1 lần trong SQL Editor).
 -- Lý do: GitHub Actions runner bị Cloudflare chặn (HTTP 403 "Attention Required"),
 -- còn IP nhà người dùng và (hy vọng) IP Supabase thì truy cập được.

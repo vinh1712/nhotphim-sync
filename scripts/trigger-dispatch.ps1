@@ -11,7 +11,7 @@ function Write-Log([string]$message) {
 
 try {
   # NguonC chặn IP GitHub runner -> lấy danh sách bằng IP máy nhà, đẩy lên nhánh nc-cache.
-  # Nếu bước này hỏng thì VẪN phải dispatch; auto-sync sẽ tự fallback qua RPC/cache cũ.
+  # Nếu bước này hỏng thì VẪN phải dispatch; auto-sync đọc cache cũ trên nc-cache.
   # Phải bọc riêng: với $ErrorActionPreference=Stop, stderr của native command khi
   # redirect 2>&1 có thể throw và nhảy thẳng vào catch ngoài -> không chạy dòng gh bên dưới.
   $cacheScript = Join-Path $PSScriptRoot "update-nc-cache.ps1"
