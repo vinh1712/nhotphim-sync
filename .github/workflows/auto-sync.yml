@@ -5,7 +5,7 @@ name: Auto sync nhẹ (3 nguồn)
 # nhật" của 3 nguồn, chỉ sync phim có mốc modified đổi và tối đa 1 phim mới.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
