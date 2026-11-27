@@ -1,5 +1,8 @@
 // Probe tạm: chạy trên GitHub runner để xem NguonC trả gì và đường nào dự phòng được.
 // Không đọc/ghi Supabase, không dùng secret.
+const dns = require("node:dns");
+const { execFileSync } = require("node:child_process");
+
 const H = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
@@ -14,13 +17,17 @@ const enc = encodeURIComponent(API);
 
 const TARGETS = [
   ["direct", API],
-  ["www", API.replace("https://phim.nguonc.com", "https://www.phim.nguonc.com")],
-  ["bare", API.replace("https://phim.nguonc.com", "https://nguonc.com")],
   ["allorigins", `https://api.allorigins.win/raw?url=${enc}`],
-  ["codetabs", `https://api.codetabs.com/v1/proxy?quest=${enc}`],
-  ["corsproxy", `https://corsproxy.io/?${API}`],
-  ["jina", `https://r.jina.ai/http://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1`],
+  ["microlink", `https://api.microlink.io/?url=${enc}&meta=false`],
+  ["cors-eu", `https://cors.eu.org/${API}`],
+  ["corslol", `https://api.cors.lol/?url=${enc}`],
 ];
+
+function cfInfo(text) {
+  const code = text.match(/Error (code|number)\s*:?\s*(\d+)/i) || text.match(/\b(10\d\d)\b/);
+  const ray = text.match(/Ray ID\s*:?\s*([a-f0-9]+)/i);
+  return `cf=${code ? code[2] || code[1] : "-"} ray=${ray ? ray[1] : "-"}`;
+}
 
 async function probe(name, url) {
   const ctrl = new AbortController();
@@ -31,12 +38,11 @@ async function probe(name, url) {
     let info = "";
     try {
       const d = JSON.parse(text);
-      info = `items=${(d.items || []).length}`;
+      info = `items=${(d.items || (d.data && d.data.items) || []).length}`;
     } catch {
-      info = `non-json(len=${text.length})`;
+      info = `non-json(len=${text.length}) ${cfInfo(text)}`;
     }
-    console.log(`${name.padEnd(10)} status=${r.status} type=${r.headers.get("content-type") || "-"} ${info} head=${JSON.stringify(text.slice(0, 100))}`);
-    if (r.status === 403) console.log(`${name} 403-body=${JSON.stringify(text.slice(0, 500))}`);
+    console.log(`${name.padEnd(10)} status=${r.status} ${info} head=${JSON.stringify(text.slice(0, 80))}`);
   } catch (e) {
     console.log(`${name.padEnd(10)} ERR ${e.name}: ${e.message}`);
   } finally {
@@ -44,6 +50,25 @@ async function probe(name, url) {
   }
 }
 
+function probeCurl() {
+  try {
+    const args = ["-sS", "-L", "--max-time", "20", "-o", "/tmp/nc.json", "-w", "%{http_code}"];
+    for (const [k, v] of Object.entries(H)) args.push("-H", `${k}: ${v}`);
+    args.push(API);
+    const code = execFileSync("curl", args, { encoding: "utf8" }).trim();
+    const text = require("node:fs").readFileSync("/tmp/nc.json", "utf8");
+    let info = "";
+    try { info = `items=${JSON.parse(text).items.length}`; } catch { info = `non-json(len=${text.length}) ${cfInfo(text)}`; }
+    console.log(`curl       status=${code} ${info} head=${JSON.stringify(text.slice(0, 80))}`);
+  } catch (e) {
+    console.log(`curl       ERR ${e.message}`);
+  }
+}
+
 (async () => {
-  for (const [name, url] of TARGETS) await probe(name, url);
+  await probe("direct", API);
+  probeCurl();
+  dns.setDefaultResultOrder("ipv6first");
+  await probe("ipv6", API);
+  for (const [name, url] of TARGETS.slice(1)) await probe(name, url);
 })();
