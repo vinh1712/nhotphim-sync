@@ -21,6 +21,16 @@ async function rpc(name, body) {
 async function main() {
   const s = await fetch(`${url}/rest/v1/auto_sync_state?select=id&id=eq.1`, { headers: H });
   console.log(`auto_sync_state     ${s.status} ${JSON.stringify((await s.text()).slice(0, 200))}`);
+
+  const root = await fetch(`${url}/rest/v1/`, { headers: { ...H, Accept: "application/openapi+json" } });
+  const spec = await root.text();
+  try {
+    const paths = Object.keys(JSON.parse(spec).paths || {});
+    console.log(`openapi             ${root.status} rpc=${JSON.stringify(paths.filter((p) => p.includes("/rpc/")))}`);
+    console.log(`openapi tables      ${JSON.stringify(paths.filter((p) => !p.includes("/rpc/")))}`);
+  } catch {
+    console.log(`openapi             ${root.status} ${JSON.stringify(spec.slice(0, 300))}`);
+  }
   for (const name of ["exec_sql", "exec", "run_sql", "query", "sql", "http_get"]) {
     await rpc(name, { sql: "select 1 as ok", query: "select 1 as ok" });
   }
