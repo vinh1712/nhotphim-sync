@@ -35,9 +35,9 @@ if (!SB_URL || !SB_KEY) {
   process.exit(1);
 }
 
-const NGUONC_BASE = "https://phim.nguonc.com/api";
-const KKPHIM_BASE = "https://phimapi.com";
-const VODPHIM_BASE = "https://api.xink.pro/api/content";
+const NGUONC_BASE = process.env.NGUONC_BASE || "https://phim.nguonc.com/api";
+const KKPHIM_BASE = process.env.KKPHIM_BASE || "https://phimapi.com";
+const VODPHIM_BASE = process.env.VODPHIM_BASE || "https://api.xink.pro/api/content";
 const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
@@ -1061,4 +1061,16 @@ async function main() {
   if (targets.length && failed > targets.length / 2) process.exit(1);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Khi được require() từ scripts/auto-sync.js thì KHÔNG tự chạy main() — script
+// nền chỉ mượn các helper ở đây để sync đúng phim vừa đổi mốc.
+if (require.main === module) {
+  main().catch((e) => { console.error(e); process.exit(1); });
+}
+
+module.exports = {
+  SB_URL, SB_KEY, SB_HEADERS, DRY_RUN,
+  NGUONC_BASE, KKPHIM_BASE, VODPHIM_BASE,
+  fetchJson, normalizeStr, dedupKey, keysMatch, isDuplicateMovie, extractEpNum,
+  pickVietsubServerData, buildUpdate, patchMovie, pushNotifs, syncFromKKOnly,
+  insertMovie, GENRE_IMPORT_MAP, COUNTRY_IMPORT_MAP, sleep,
+};

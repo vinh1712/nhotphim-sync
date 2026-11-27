@@ -1,0 +1,35 @@
+name: Auto sync nhẹ (3 nguồn)
+
+# Chạy ngầm, không cần mở trang admin. Đặt 15 phút/lần (GitHub cho phép tối thiểu
+# 5 phút) để giảm số lượt chạy và egress. Mỗi lượt chỉ đọc page 1 "phim mới cập
+# nhật" của 3 nguồn, chỉ sync phim có mốc modified đổi và tối đa 1 phim mới.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Chạy thử (không ghi vào DB)"
+        type: boolean
+        default: false
+
+# Không để auto-sync chồng với sync tay (sync-episodes.yml).
+concurrency:
+  group: nhotphim-sync
+  cancel-in-progress: false
+
+jobs:
+  auto-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Chạy auto-sync
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: node scripts/auto-sync.js

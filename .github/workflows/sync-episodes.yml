@@ -1,9 +1,14 @@
 name: Sync tập mới NhotPhim
 
+# Không chạy theo khung giờ nữa. Việc phát hiện "phim mới cập nhật" của
+# NguonC/KKPhim/VodPhim do auto-sync.yml đảm nhận (mỗi 15 phút).
+# Workflow này chỉ giữ lại để chạy tay khi cần quét toàn bảng.
+# Không chạy cùng lúc với auto-sync.yml để tránh ghi trùng episodes/thông báo.
+concurrency:
+  group: nhotphim-sync
+  cancel-in-progress: false
+
 on:
-  schedule:
-    # Mỗi tối 22:00 giờ Việt Nam = 15:00 UTC
-    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
