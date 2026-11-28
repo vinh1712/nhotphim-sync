@@ -11,6 +11,10 @@ $repoUrl = "https://github.com/$repo.git"
 $log = Join-Path $env:TEMP "nhotphim-nc-cache.log"
 $work = Join-Path $env:TEMP "nhotphim-nc-cache-repo"
 
+# Anon key là public key (web cũng dùng để đọc movies). Cho phép override bằng env.
+$sbUrl = "https://tlbumpjugtltznzuwqwt.supabase.co"
+$sbAnon = if ($env:SUPABASE_ANON_KEY) { $env:SUPABASE_ANON_KEY } else { "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsYnVtcGp1Z3RsdHpuenV3cXd0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgyNjc0NDksImV4cCI6MjA5Mzg0MzQ0OX0.EMgx5_nREnfjZaIaLwU9q_KknbnqdxA2fbic_G_Xfdc" }
+
 function Write-Log([string]$message) {
   Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date).ToString("o"), $message)
 }
@@ -51,11 +55,34 @@ try {
   $items = @($data.items)
   if (-not $items.Count) { throw "Không có items" }
 
+  # Ngoài page 1, nạp thêm detail cho các phim bộ đang chiếu đã có ophim_slug
+  # trong DB — để SV1 vẫn có link khi phim được sync nhờ mốc đổi của KK/VodPhim.
+  $extraSlugs = @()
+  try {
+    $done = [uri]::EscapeDataString("Hoàn thành")
+    $q = "$sbUrl/rest/v1/movies?select=id,ophim_slug&type=neq.movie&epstatus=neq.$done&ophim_slug=not.is.null&order=id.desc&limit=40"
+    $sbHeaders = @{ apikey = $sbAnon; "Authorization" = "Bearer $sbAnon" }
+    $rows = Invoke-WebRequest -Uri $q -Headers $sbHeaders -TimeoutSec 30 -UseBasicParsing
+    foreach ($row in ($rows.Content | ConvertFrom-Json)) {
+      $s = [string]$row.ophim_slug
+      if ($s) { $extraSlugs += $s }
+    }
+  } catch {
+    Write-Log ("WARN không lấy được slug từ DB: {0}" -f $_.Exception.Message)
+  }
+
+  $slugTargets = [ordered]@{}
+  foreach ($it in $items) {
+    $s = [string]$it.slug
+    if ($s) { $slugTargets[$s] = 1 }
+  }
+  foreach ($s in $extraSlugs) { if ($s) { $slugTargets[$s] = 1 } }
+  Write-Log ("slug targets: page1={0} + DB={1} -> {2}" -f $items.Count, $extraSlugs.Count, $slugTargets.Count)
+
   # Fetch detail từng phim ngay trên máy nhà. Runner chỉ đọc JSON này.
   $details = @{}
   $okDetail = 0
-  foreach ($it in $items) {
-    $slug = [string]$it.slug
+  foreach ($slug in $slugTargets.Keys) {
     if (-not $slug) { continue }
 
     $detailUrl = "https://phim.nguonc.com/api/film/" + [uri]::EscapeDataString($slug)

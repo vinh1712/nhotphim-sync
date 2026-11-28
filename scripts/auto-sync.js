@@ -505,18 +505,47 @@ async function main() {
 
   try {
     const movies = await loadMoviesLite();
-    const targets = [], newCandidates = [], seen = new Set();
+    const targets = [], seen = new Set();
     const ncSlugByMovieId = new Map();
     changed.forEach((it) => {
       const m = findMovie(it, movies);
-      if (!m) { newCandidates.push(it); return; }
+      if (!m) return;
       // Nhớ slug NguonC của item vừa đổi để truyền vào sync (điền đúng SV1).
       if (it.src === "nc" && it.slug) ncSlugByMovieId.set(m.id, it.slug);
       if (seen.has(m.id)) return;
       seen.add(m.id);
       targets.push(m);
     });
-    console.log(`Đổi ${changed.length} mốc → ${targets.length} phim có trong DB, ${newCandidates.length} ứng viên mới.`);
+
+    // Thêm phim MỚI: xét TOÀN BỘ page 1 của KK/VodPhim, không phụ thuộc vào
+    // mốc modified (mốc chỉ dùng để quyết định sync tập cho phim đã có).
+    // Loại các slug đã lưu trong extra.sourceSlug để khỏi gọi detail lại mãi.
+    const known = { kk: new Set(), vp: new Set() };
+    movies.forEach((m) => {
+      const slugs = (parseExtra(m.extra) || {}).sourceSlug || {};
+      if (slugs.kk) known.kk.add(String(slugs.kk));
+      if (slugs.vp) known.vp.add(String(slugs.vp));
+    });
+    const newCandidates = [];
+    const candSeen = new Set();
+    for (const src of ADD_SOURCES) {
+      for (const it of (latestBySrc[src] || [])) {
+        if (!it.slug || known[src].has(it.slug)) continue;
+        const key = `${src}:${it.slug}`;
+        if (candSeen.has(key)) continue;
+        candSeen.add(key);
+        newCandidates.push(it);
+      }
+    }
+    // Phòng trường hợp item đổi mốc nhưng không còn nằm trong page 1 lúc đọc.
+    changed.forEach((it) => {
+      if (!ADD_SOURCES.includes(it.src) || !it.slug || known[it.src].has(it.slug)) return;
+      const key = `${it.src}:${it.slug}`;
+      if (candSeen.has(key)) return;
+      candSeen.add(key);
+      newCandidates.push(it);
+    });
+    console.log(`Đổi ${changed.length} mốc → ${targets.length} phim có trong DB; ${newCandidates.length} ứng viên mới KK/VP chưa có slug trong DB.`);
 
     const notifs = [];
     let synced = 0;
