@@ -41,7 +41,9 @@ function Get-GitToken {
 function Invoke-Dispatch {
   $gh = Get-GhPath
   if ($gh) {
-    $output = & $gh workflow run $workflow --repo $repo 2>&1
+    $argsGh = @("workflow", "run", $workflow, "--repo", $repo)
+    if ($env:NHOTPHIM_FORCE_SWEEP -eq "1") { $argsGh += @("--field", "force_sweep=true") }
+    $output = & $gh @argsGh 2>&1
     Write-Log ("OK gh " + ($output -join " "))
     return
   }
@@ -56,7 +58,9 @@ function Invoke-Dispatch {
     "X-GitHub-Api-Version" = "2022-11-28"
     "User-Agent" = "nhotphim-dispatch"
   }
-  $body = @{ ref = "main"; inputs = @{ dry_run = "false" } } | ConvertTo-Json
+  $inputs = @{ dry_run = "false" }
+  if ($env:NHOTPHIM_FORCE_SWEEP -eq "1") { $inputs.force_sweep = "true" }
+  $body = @{ ref = "main"; inputs = $inputs } | ConvertTo-Json
   $uri = "https://api.github.com/repos/$repo/actions/workflows/$workflow/dispatches"
   $null = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -TimeoutSec 30
   Write-Log "OK REST dispatch (204)"

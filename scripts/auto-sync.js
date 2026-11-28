@@ -456,7 +456,7 @@ async function main() {
   resetNcDirectBlock();
   const state = await loadState();
   state.__runs = (parseInt(state.__runs) || 0) + 1;
-  const sweep = state.__runs % SWEEP_EVERY === 0;
+  const sweep = process.env.FORCE_SWEEP === "1" || state.__runs % SWEEP_EVERY === 0;
   if (sweep) console.log(`Lượt ${state.__runs}: quét lại page 1 (bỏ qua mốc modified) để không sót tập mới.`);
   const changed = [];
   const latestBySrc = {};
@@ -497,11 +497,10 @@ async function main() {
     }
   }
 
-  if (!changed.length) {
-    await saveState(state);
-    console.log("Không có mốc đổi. Xong.");
-    return;
-  }
+  // KHÔNG return sớm ở đây: dù không có mốc modified đổi, vẫn phải xét toàn bộ
+  // page 1 của KK/VodPhim để thêm phim mới (phim mới chỉ xuất hiện 1 lần trên
+  // page 1 rồi trôi đi, nên phụ thuộc vào mốc đổi là không bao giờ thêm được).
+  if (!changed.length) console.log("Không có mốc đổi — vẫn xét ứng viên phim mới KK/VP…");
 
   try {
     const movies = await loadMoviesLite();
@@ -531,6 +530,9 @@ async function main() {
     for (const src of ADD_SOURCES) {
       for (const it of (latestBySrc[src] || [])) {
         if (!it.slug || known[src].has(it.slug)) continue;
+        // Lọc sơ bằng tên/năm có sẵn từ danh sách: DB thường không lưu sourceSlug,
+        // nếu không lọc thì 12 lượt gọi detail bị tiêu vào phim đã có trong DB.
+        if (findMovie(it, movies)) continue;
         const key = `${src}:${it.slug}`;
         if (candSeen.has(key)) continue;
         candSeen.add(key);

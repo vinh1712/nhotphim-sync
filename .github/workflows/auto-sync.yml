@@ -15,6 +15,10 @@ on:
         description: "Chạy thử (không ghi vào DB)"
         type: boolean
         default: false
+      force_sweep:
+        description: "Ép quét lại page 1 (để kiểm chứng SV1/NguonC ngay)"
+        type: boolean
+        default: false
 
 # Chỉ có 1 workflow sync nên không cho chạy chồng chính nó.
 concurrency:
@@ -49,4 +53,5 @@ jobs:
           AUTO_ADD_COUNTRY: cn
           AUTO_ADD_MIN_YEAR: "2026"
           SWEEP_EVERY: "4"
+          FORCE_SWEEP: ${{ inputs.force_sweep && '1' || '0' }}
         run: node scripts/auto-sync.js
