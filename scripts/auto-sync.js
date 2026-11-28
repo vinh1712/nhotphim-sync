@@ -5,9 +5,11 @@
 //   2. So mốc modified.time với mốc đã lưu ở bảng public.auto_sync_state.
 //   3. Phim đã có trong DB -> sync 3 server RIÊNG BIỆT bằng helper của sync.js
 //      (NguonC -> link, KKPhim -> link2, VodPhim -> link3; không thay thế chéo).
-//   4. Phim chưa có -> thêm tối đa 1 phim Hàn Quốc (năm >= 2026) mỗi lượt, xoay vòng nguồn.
+//   4. Phim chưa có -> thêm tối đa 1 phim Trung Quốc (năm >= 2026) mỗi lượt,
+//      CHỈ lấy từ KKPhim/VodPhim (NguonC bị Cloudflare chặn trên runner).
 //
 // Lần chạy đầu CHỈ ghi mốc (baseline), không import hàng loạt.
+// Lịch thực tế: 30 phút/lượt (khung :00/:30) do máy nhà dispatch.
 // Trạng thái lưu ở bảng riêng auto_sync_state, KHÔNG nằm trong app_settings để
 // không làm trigger touch_site_version() đổi cờ và bắt web tải lại danh sách.
 //
@@ -15,12 +17,16 @@
 //   SUPABASE_URL, SUPABASE_SERVICE_KEY  (bắt buộc, lấy từ sync.js)
 //   DRY_RUN=1                           chỉ log, không ghi DB
 //   AUTO_ADD_MIN_YEAR                   mặc định 2026
+//   AUTO_ADD_COUNTRY                    mã quốc gia cần thêm, mặc định "cn" (Trung Quốc)
+//   MAX_ADD_PER_RUN / MAX_ADD_DETAILS   số phim thêm / số detail tối đa mỗi lượt
+//   SWEEP_EVERY                         mỗi N lượt quét lại page 1 bỏ qua mốc (mặc định 4 = 2h)
 //   NGUONC_BASE / KKPHIM_BASE / VODPHIM_BASE  (tùy chọn, dùng khi test)
 
 const S = require("./sync.js");
 const {
   SB_URL, SB_HEADERS, DRY_RUN,
-  fetchJson, dedupKey, keysMatch, isDuplicateMovie, extractEpNum, pickVietsubServerData,
+  fetchJson, fetchNcJson, resetNcDirectBlock, isNcDirectBlocked, getNcCacheAgeMs,
+  dedupKey, keysMatch, isDuplicateMovie, extractEpNum, pickVietsubServerData,
   patchMovie, pushNotifs, syncFromAllSources, insertMovie,
   setNcDetailCache, getNcDetail, normalizeNcDetail, parseExtra,
   GENRE_IMPORT_MAP, COUNTRY_IMPORT_MAP, sleep,
@@ -30,10 +36,14 @@ const NGUONC_BASE = process.env.NGUONC_BASE || "https://phim.nguonc.com/api";
 const KKPHIM_BASE = process.env.KKPHIM_BASE || "https://phimapi.com";
 const VODPHIM_BASE = process.env.VODPHIM_BASE || "https://api.xink.pro/api/content";
 
-const MAX_SYNC_MOVIES = 8;   // giới hạn phim đã có được sync trong 1 lượt
-const MAX_ADD_PER_RUN = 1;   // 1 phim mới / 15 phút -> web fetch lại danh sách tối đa 1 lần
-const MAX_DETAILS = 6;       // giới hạn gọi detail khi chưa tìm thấy ứng viên hợp lệ
+const MAX_SYNC_MOVIES = parseInt(process.env.MAX_SYNC_MOVIES) || 8; // phim đã có sync / lượt
+const MAX_ADD_PER_RUN = parseInt(process.env.MAX_ADD_PER_RUN) || 1; // phim mới / lượt
+const MAX_DETAILS = parseInt(process.env.MAX_ADD_DETAILS) || 12;    // giới hạn gọi detail / lượt
 const MIN_YEAR = parseInt(process.env.AUTO_ADD_MIN_YEAR) || 2026;
+const AUTO_ADD_COUNTRY = (process.env.AUTO_ADD_COUNTRY || "cn").toLowerCase(); // cn = Trung Quốc
+const SOURCE_FAIL_LIMIT = 2; // 1 nguồn lỗi 2 lần liên tiếp -> bỏ nguồn đó trong lượt này
+const SWEEP_EVERY = parseInt(process.env.SWEEP_EVERY) || 4; // mỗi 4 lượt (2h) quét lại page 1
+const NC_FRESH_MS = 45 * 60 * 1000; // cache nc-cache tươi trong 45 phút
 
 const SOURCES = [
   { src: "nc", url: `${NGUONC_BASE}/films/phim-moi-cap-nhat?page=1`, referer: "https://phim.nguonc.com/" },
@@ -122,24 +132,45 @@ function mapLatest(cfg, d) {
 
 async function fetchLatest(cfg) {
   // NguonC chặn IP GitHub runner. Máy nhà fetch rồi đẩy JSON lên nhánh nc-cache,
-  // workflow tải về file này; vẫn tự gọi trực tiếp nếu cache cũ/không có.
-  if (cfg.src === "nc" && process.env.NGUONC_LIST_FILE) {
-    try {
-      const fs = require("fs");
-      const d = JSON.parse(fs.readFileSync(process.env.NGUONC_LIST_FILE, "utf8"));
-      const at = d._fetched_at ? Date.parse(d._fetched_at) : NaN;
-      const ageMs = Date.now() - at;
-      if (!Number.isFinite(ageMs) || ageMs > 45 * 60 * 1000) {
-        throw new Error(`cache cũ (${Math.round(ageMs / 60000)} phút)`);
+  // workflow chỉ tải file này. Nếu cache cũ thì VẪN GIỮ detail làm fallback rồi
+  // thử gọi trực tiếp; 403 thì dùng lại detail đã validate thay vì bỏ trống SV1.
+  if (cfg.src === "nc") {
+    let cached = null;
+    if (process.env.NGUONC_LIST_FILE) {
+      try {
+        const fs = require("fs");
+        cached = JSON.parse(fs.readFileSync(process.env.NGUONC_LIST_FILE, "utf8"));
+      } catch (e) {
+        console.warn(`[nc] không đọc được cache (${e.message})`);
       }
-      // detail đi kèm cache để sync SV1 mà không gọi NguonC trên runner.
-      setNcDetailCache(d.details || {}, d.items || []);
-      console.log(`[nc] dùng cache local (${Math.round(ageMs / 60000)} phút trước, ${Object.keys(d.details || {}).length} detail)`);
-      return mapLatest(cfg, d);
-    } catch (e) {
-      // Cache cũ/không đọc được thì KHÔNG được dùng detail cũ điền vào SV1.
+    }
+    const at = cached && cached._fetched_at ? Date.parse(cached._fetched_at) : NaN;
+    const ageMs = Number.isFinite(at) ? Date.now() - at : NaN;
+    const fresh = cached && Number.isFinite(ageMs) && ageMs <= NC_FRESH_MS;
+
+    if (fresh) {
+      setNcDetailCache(cached.details || {}, cached.items || [], cached._fetched_at);
+      console.log(`[nc] dùng cache tươi (${Math.round(ageMs / 60000)} phút trước, ${Object.keys(cached.details || {}).length} detail)`);
+      return mapLatest(cfg, cached);
+    }
+
+    if (cached && Array.isArray(cached.items)) {
+      // Giữ detail cũ: link các tập đã đăng trên NguonC không đổi theo thời gian,
+      // chỉ cần validate tên/năm khi dùng (xem sync.js::getNCFullData).
+      setNcDetailCache(cached.details || {}, cached.items || [], cached._fetched_at);
+      console.warn(`[nc] cache cũ (${Number.isFinite(ageMs) ? Math.round(ageMs / 60000) + " phút" : "không rõ mốc"}) — giữ ${Object.keys(cached.details || {}).length} detail làm fallback, thử gọi trực tiếp…`);
+    } else {
       setNcDetailCache({}, []);
-      console.warn(`[nc] cache không dùng được (${e.message}), gọi trực tiếp…`);
+    }
+
+    try {
+      return mapLatest(cfg, await fetchNcJson(cfg.url, cfg.referer));
+    } catch (e) {
+      if (cached && Array.isArray(cached.items)) {
+        console.warn(`[nc] gọi trực tiếp lỗi (${e.message}) → dùng danh sách cache cũ để sync các tập đã biết.`);
+        return mapLatest(cfg, cached);
+      }
+      throw e;
     }
   }
   return mapLatest(cfg, await fetchJson(cfg.url, 15000, cfg.referer));
@@ -175,9 +206,12 @@ function countryCodes(list) {
   // Đa số API trả mảng, nhưng có nguồn trả string ("Hàn Quốc" / "kr") —
   // nếu không chuẩn hóa ở đây thì .forEach() sẽ throw và làm cả lượt sync chết.
   const arr = Array.isArray(list) ? list : typeof list === "string" ? list.split(",") : [];
+  const KNOWN = new Set(["kr", "cn", "tw", "hk", "jp", "us", "in", "vn", "th"]);
   arr.forEach((c) => {
     if (!c) return;
-    const v = COUNTRY_IMPORT_MAP[String(typeof c === "string" ? c : (c.name || c.slug || "")).toLowerCase()];
+    const raw = String(typeof c === "string" ? c : (c.name || c.slug || "")).toLowerCase();
+    if (KNOWN.has(raw)) { out.add(raw); return; }
+    const v = COUNTRY_IMPORT_MAP[raw];
     if (v) out.add(v);
   });
   return out;
@@ -208,8 +242,23 @@ function findMovie(item, movies) {
 // ---------- Detail 3 nguồn (đều trả về chuẩn: thumb_url=poster, poster_url=backdrop) ----------
 async function detailNC(slug) {
   try {
-    // Ưu tiên detail đã được máy nhà fetch sẵn trong nc-latest.json.
-    const d = getNcDetail(slug) || await fetchJson(`${NGUONC_BASE}/film/${encodeURIComponent(slug)}`, 15000, "https://phim.nguonc.com/");
+    const cached = getNcDetail(slug);
+    const age = getNcCacheAgeMs();
+    let d = null;
+    // Detail tươi thì dùng luôn; detail cũ thì thử lấy bản mới, 403 thì đợi
+    // fallback ở dưới (getNCFullData/syncFromAllSources cũng dùng chung cache này).
+    if (cached && Number.isFinite(age) && age <= NC_FRESH_MS) d = cached;
+    if (!d && !isNcDirectBlocked()) {
+      try {
+        d = await fetchNcJson(`${NGUONC_BASE}/film/${encodeURIComponent(slug)}`, "https://phim.nguonc.com/");
+      } catch (e) {
+        if (!cached) throw e;
+        console.warn(`  NC detail lỗi (${e.message}) → dùng cache cũ cho "${slug}"`);
+        d = cached;
+      }
+    }
+    if (!d) d = cached;
+    if (!d) return { movie: null, episodes: [] };
     const out = normalizeNcDetail(d, slug);
     return out.movie ? out : { movie: null, episodes: [] };
   } catch (e) { console.warn(`  NC detail lỗi (${slug}): ${e.message}`); return { movie: null, episodes: [] }; }
@@ -266,13 +315,20 @@ async function detailVP(slug) {
 const DETAILERS = { nc: detailNC, kk: detailKK, vp: detailVP };
 
 // ---------- Thêm phim mới ----------
-function isKorean(country) {
+// Mặc định thêm phim Trung Quốc (cn) năm >= 2026. Có thể đổi bằng env
+// AUTO_ADD_COUNTRY=kr|us|... ; so khớp cả mã lẫn tên để nguồn trả string vẫn dính.
+const COUNTRY_NAMES = { cn: "trung quoc", kr: "han quoc", jp: "nhat ban", us: "au my", vn: "viet nam" };
+function isAllowedCountry(country) {
   const arr = Array.isArray(country) ? country : typeof country === "string" ? [country] : [];
-  return countryCodes(arr).has("kr") || arr.some((c) => {
+  if (countryCodes(arr).has(AUTO_ADD_COUNTRY)) return true;
+  const wanted = S.normalizeStr(COUNTRY_NAMES[AUTO_ADD_COUNTRY] || AUTO_ADD_COUNTRY);
+  return !!(wanted && arr.some((c) => {
     const n = S.normalizeStr(String(typeof c === "string" ? c : (c.name || c.slug || "")));
-    return n.includes("han quoc") || n.includes("han-quoc");
-  });
+    return n.includes(wanted);
+  }));
 }
+// Giữ alias cũ để không phá test/code gọi isKorean.
+const isKorean = isAllowedCountry;
 
 function buildNewPayload(movie, episodes, src, slug) {
   const isSingle = movie.type === "single";
@@ -319,26 +375,59 @@ function buildNewPayload(movie, episodes, src, slug) {
   return payload;
 }
 
+// NguonC bị Cloudflare chặn trên runner → chỉ dùng để sync tập (SV1), KHÔNG dùng
+// để thêm phim mới. Ứng viên mới chỉ lấy từ KKPhim (SV2) và VodPhim (SV3).
+const ADD_SOURCES = ["kk", "vp"];
+
 async function addNewMovies(candidates, state, movies) {
   if (!candidates.length) return 0;
-  const order = ["nc", "kk", "vp"];
-  const pref = order[(order.indexOf(state.lastSrc || "") + 1 + order.length) % order.length];
+  const pool = candidates.filter((it) =>
+    ADD_SOURCES.includes(it.src) && (parseInt(it.year) || 0) >= MIN_YEAR);
+  if (!pool.length) return 0;
+
+  const cur = ADD_SOURCES.indexOf(state.lastSrc);
+  const pref = ADD_SOURCES[(cur + 1) % ADD_SOURCES.length];
   // DRY_RUN không ghi DB nên không được làm xoay nguồn trong state.
-  if (!DRY_RUN) state.lastSrc = pref; // xoay vòng dù lượt này không thêm được -> cả 3 nguồn đều có lượt
-  const ordered = candidates.slice().sort((a, b) => (a.src === pref ? -1 : 0) - (b.src === pref ? -1 : 0));
+  if (!DRY_RUN) state.lastSrc = pref;
+
+  const seen = new Set();
+  const bySrc = { kk: [], vp: [] };
+  pool.forEach((it) => {
+    if (!it.slug) return;
+    const key = `${it.src}:${it.slug}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    bySrc[it.src].push(it);
+  });
+  // Đan xen 2 nguồn (ưu tiên nguồn đang tới lượt) để KK không chiếm hết quota
+  // MAX_DETAILS trước khi VodPhim được xét.
+  const other = ADD_SOURCES.find((s) => s !== pref);
+  const ordered = [];
+  for (let i = 0; ; i++) {
+    const a = bySrc[pref][i], b = bySrc[other][i];
+    if (!a && !b) break;
+    if (a) ordered.push(a);
+    if (b) ordered.push(b);
+  }
+
   const existing = movies.map(asExisting);
   let added = 0, checked = 0;
+  const failures = { kk: 0, vp: 0 };
 
   for (const it of ordered) {
     if (added >= MAX_ADD_PER_RUN || checked >= MAX_DETAILS) break;
-    if ((parseInt(it.year) || 0) < MIN_YEAR) continue;
-    if (it.src === "vp" && !isKorean(it.country)) continue;
+    // Một nguồn lỗi 2 lần liên tiếp thì bỏ các ứng viên còn lại của nguồn đó
+    // trong lượt này, chuyển sang nguồn kia — không để quota cháy trước khi tới VP.
+    if (failures[it.src] >= SOURCE_FAIL_LIMIT) continue;
+    checked++;
     try {
-      checked++;
       const { movie, episodes } = await DETAILERS[it.src](it.slug);
-      if (!movie || !movie.name) continue;
+      if (!movie || !movie.name) { failures[it.src]++; continue; }
       if ((parseInt(movie.year) || 0) < MIN_YEAR) continue;
-      if (!isKorean(movie.country)) continue;
+      if (!isAllowedCountry(movie.country)) {
+        console.log(`  = Bỏ qua (không phải ${AUTO_ADD_COUNTRY}): ${movie.name}`);
+        continue;
+      }
       if (isDuplicateMovie(movie.name, movie.origin_name, movie.year, existing)) {
         console.log(`  = Bỏ qua (đã có trong DB): ${movie.name}`);
         continue;
@@ -350,8 +439,12 @@ async function addNewMovies(candidates, state, movies) {
         console.log(`  ${DRY_RUN ? "[DRY_RUN] sẽ thêm" : "+"} Phim mới [${it.src}]: ${payload.title} (${payload.year})`);
       }
     } catch (e) {
+      failures[it.src]++;
       console.warn(`  Lỗi thêm phim [${it.src}/${it.slug}]: ${e.message}`);
     }
+  }
+  if (failures.kk || failures.vp) {
+    console.log(`  Lượt thêm phim: bỏ qua ${failures.kk} ứng viên KK, ${failures.vp} ứng viên VP do lỗi/detail rỗng.`);
   }
   return added;
 }
@@ -359,8 +452,14 @@ async function addNewMovies(candidates, state, movies) {
 // ---------- main ----------
 async function main() {
   console.log(`Auto-sync ngắn bắt đầu ${new Date().toISOString()}${DRY_RUN ? " (DRY RUN)" : ""}`);
+  // Mỗi lượt được phép thử lại NguonC từ đầu; trong lượt thì 403 chỉ báo 1 lần.
+  resetNcDirectBlock();
   const state = await loadState();
+  state.__runs = (parseInt(state.__runs) || 0) + 1;
+  const sweep = state.__runs % SWEEP_EVERY === 0;
+  if (sweep) console.log(`Lượt ${state.__runs}: quét lại page 1 (bỏ qua mốc modified) để không sót tập mới.`);
   const changed = [];
+  const latestBySrc = {};
 
   const results = await Promise.allSettled(SOURCES.map(fetchLatest));
   results.forEach((res, i) => {
@@ -369,6 +468,7 @@ async function main() {
       console.warn(`[${src}] bỏ qua lượt này: ${res.reason && res.reason.message || res.reason}`);
       return;
     }
+    latestBySrc[src] = res.value;
     const bucket = state[src] || (state[src] = {});
     const firstRun = !bucket.__init;
     if (firstRun) bucket.__init = 1;
@@ -382,6 +482,20 @@ async function main() {
       if (!firstRun && (!prev || prev !== it.modified)) changed.push(it);
     });
   });
+
+  // Định kỳ (mặc định 2h/lần) quét lại page 1 kể cả khi mốc không đổi — đề phòng
+  // nguồn cập nhật tập nhưng quên đổi modified, hoặc lượt trước bị lỗi mạng.
+  if (sweep) {
+    const seen = new Set(changed.map((it) => `${it.src}:${it.slug}`));
+    for (const src of SOURCES.map((s) => s.src)) {
+      for (const it of (latestBySrc[src] || []).slice(0, MAX_SYNC_MOVIES)) {
+        const key = `${it.src}:${it.slug}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        changed.push(it);
+      }
+    }
+  }
 
   if (!changed.length) {
     await saveState(state);
@@ -421,6 +535,8 @@ async function main() {
             if (result.hasNewEp) {
               console.log(`  ✓ Tập mới: ${m.title} ${m.currentep || 0} → ${result.curNum}`);
               notifs.push({ title: m.title, ep: result.ep, poster: m.poster || "", created_at: new Date().toISOString() });
+            } else if (result.linksChanged) {
+              console.log(`  ~ Chỉ đổi link (số tập giữ nguyên): ${m.title}`);
             }
           }
         } catch (e) {
@@ -444,5 +560,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  modTime, findMovie, buildNewPayload, isKorean, countryCodes, fetchLatest, withNcSlug, SOURCES,
+  modTime, findMovie, buildNewPayload, isKorean, isAllowedCountry, countryCodes,
+  fetchLatest, withNcSlug, SOURCES, addNewMovies,
 };

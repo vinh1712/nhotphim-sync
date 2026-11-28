@@ -32,8 +32,20 @@ try {
   # Ghi ra file rồi đọc lại bằng UTF-8: PS 5.1 tự đo charset sai, làm tên phim
   # bị mojibake ("Cá»™ng...") -> findNcSlugFromCache khớp tên không được.
   $tmpList = Join-Path $env:TEMP "nhotphim-nc-list.json"
-  Invoke-WebRequest -Uri "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1" -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpList
-  if (-not (Test-Path -LiteralPath $tmpList)) { throw "Không tải được danh sách NguonC" }
+  $listUrl = "https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1"
+  $gotList = $false
+  for ($attempt = 1; $attempt -le 3 -and -not $gotList; $attempt++) {
+    try {
+      if (Test-Path -LiteralPath $tmpList) { Remove-Item -LiteralPath $tmpList -Force }
+      Invoke-WebRequest -Uri $listUrl -Headers $headers -TimeoutSec 30 -UseBasicParsing -OutFile $tmpList
+      if (-not (Test-Path -LiteralPath $tmpList)) { throw "Không tải được danh sách NguonC" }
+      $gotList = $true
+    } catch {
+      if ($attempt -eq 3) { throw }
+      Write-Log ("WARN list attempt {0}: {1}" -f $attempt, $_.Exception.Message)
+      Start-Sleep -Milliseconds (1000 * $attempt)
+    }
+  }
 
   $data = [IO.File]::ReadAllText($tmpList, [Text.Encoding]::UTF8) | ConvertFrom-Json
   $items = @($data.items)
@@ -72,7 +84,9 @@ try {
     }
     Start-Sleep -Milliseconds 150
   }
-  if (-not $okDetail) { throw "Không fetch được detail nào -> không ghi cache" }
+  # Không bỏ cuộc vì vài detail lỗi: danh sách vẫn hữu ích để cập nhật mốc, và
+  # runner có thể dùng lại detail cũ (đã validate tên/năm) khi bị Cloudflare chặn.
+  if (-not $okDetail) { Write-Log "WARN không fetch được detail nào -> chỉ ghi danh sách" }
 
   $payload = @{
     _fetched_at = (Get-Date).ToUniversalTime().ToString("o")
@@ -99,6 +113,26 @@ try {
   }
 
   $target = Join-Path $work $path
+
+  # Giữ lại detail từ bản cache trước cho những slug lỗi lần này (link tập cũ
+  # vẫn dùng được) — chỉ ghi đè bằng detail vừa fetch thành công.
+  if (Test-Path -LiteralPath $target) {
+    try {
+      $oldPayload = [IO.File]::ReadAllText($target, [Text.Encoding]::UTF8) | ConvertFrom-Json
+      if ($oldPayload.details) {
+        foreach ($prop in $oldPayload.details.PSObject.Properties) {
+          if (-not $details.ContainsKey($prop.Name)) { $details[$prop.Name] = $prop.Value }
+        }
+      }
+    } catch {
+      Write-Log ("WARN không đọc được detail cache cũ: {0}" -f $_.Exception.Message)
+    }
+  }
+  # Payload được tạo trước khi clone; cập nhật lại key details sau khi đã gộp.
+  $payloadObj = $payload | ConvertFrom-Json
+  $payloadObj.details = [pscustomobject]$details
+  $payload = $payloadObj | ConvertTo-Json -Depth 30 -Compress
+
   [IO.File]::WriteAllText($target, $payload, (New-Object Text.UTF8Encoding($false)))
 
   & git -C $work add -- $path | Out-Null

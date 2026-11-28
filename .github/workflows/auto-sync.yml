@@ -1,13 +1,14 @@
 name: Auto sync nhẹ (3 nguồn)
 
 # Chạy ngầm, không cần mở trang admin. Mỗi lượt chỉ đọc page 1 "phim mới cập
-# nhật" của 3 nguồn, chỉ sync phim có mốc modified đổi và tối đa 1 phim mới.
-# GitHub `schedule` đang không sinh run nên lịch 15 phút thực tế do
-# scripts/trigger-dispatch.ps1 + Task Scheduler bắn workflow_dispatch. Cron ở
-# dưới giữ lại làm dự phòng, dùng phút lệch giờ để tránh cao tải.
+# nhật" của 3 nguồn, sync phim có mốc modified đổi (có quét lại định kỳ) và tối
+# đa 1 phim Trung Quốc mới từ KKPhim/VodPhim.
+# GitHub `schedule` có thể chạy trễ/không đều nên lịch 30 phút chính do
+# scripts/trigger-dispatch.ps1 + Task Scheduler bắn workflow_dispatch ở khung
+# :00/:30. Cron ở dưới là dự phòng.
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: "0,30 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -45,4 +46,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           NGUONC_LIST_FILE: nc-latest.json
+          AUTO_ADD_COUNTRY: cn
+          AUTO_ADD_MIN_YEAR: "2026"
+          SWEEP_EVERY: "4"
         run: node scripts/auto-sync.js

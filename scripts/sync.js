@@ -52,6 +52,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // slug -> raw JSON của /api/film/{slug}. Có cache thì KHÔNG gọi NguonC trên runner.
 let NC_DETAIL_CACHE = Object.create(null);
 let NC_LIST_CACHE = [];
+let NC_DETAIL_CACHE_AT = 0; // mốc _fetched_at của file cache, để biết detail có tươi không
 
 function parseExtra(raw) {
   if (!raw) return {};
@@ -61,17 +62,22 @@ function parseExtra(raw) {
   return raw && typeof raw === "object" ? raw : {};
 }
 
-function setNcDetailCache(details = {}, items = []) {
+function setNcDetailCache(details = {}, items = [], fetchedAt = "") {
   NC_DETAIL_CACHE = details && typeof details === "object" ? details : Object.create(null);
   NC_LIST_CACHE = Array.isArray(items) ? items : [];
+  const t = fetchedAt ? Date.parse(fetchedAt) : NaN;
+  NC_DETAIL_CACHE_AT = Number.isFinite(t) ? t : 0;
 }
 
 function getNcDetail(slug) {
   return slug ? NC_DETAIL_CACHE[slug] || null : null;
 }
+function getNcCacheAgeMs() {
+  return NC_DETAIL_CACHE_AT ? Date.now() - NC_DETAIL_CACHE_AT : NaN;
+}
 
 // Ưu tiên slug đã lưu trong DB; nếu chưa có thì dò trong danh sách/detail cache
-// theo tên + năm (khớp hệt, không đoán mò để tránh gắn nhầm phim trùng tên).
+// theo tên + năm (chuẩn hóa nhưng không bỏ số phần, tránh gắn nhầm phim trùng tên).
 function findNcSlugFromCache(m) {
   if (!m) return "";
   const extra = parseExtra(m.extra);
@@ -82,7 +88,6 @@ function findNcSlugFromCache(m) {
     console.warn(`  NguonC: ophim_slug "${explicit}" là phim "${(explicitDetail.movie || {}).name}" KHÔNG khớp → bỏ, dò lại theo tên`);
   }
 
-  const q = normalizeStr(String(m.title || m.titleen || "").trim());
   const year = parseInt(m.year) || 0;
   const yearOk = (rawYear) => {
     const iy = parseInt(rawYear) || 0;
@@ -90,8 +95,13 @@ function findNcSlugFromCache(m) {
   };
 
   const hit = NC_LIST_CACHE.find((it) => {
-    const n = normalizeStr(String(it.name || it.original_name || it.originalName || "").trim());
-    return q && n === q && yearOk(it.year || it.release_year || it.nam || it.releaseYear);
+    const name = String(it.name || "");
+    const origin = String(it.original_name || it.originalName || "");
+    return yearOk(it.year || it.release_year || it.nam || it.releaseYear)
+      && (looseTitleMatch(String(m.title || ""), name)
+        || looseTitleMatch(String(m.title || ""), origin)
+        || looseTitleMatch(String(m.titleen || ""), name)
+        || looseTitleMatch(String(m.titleen || ""), origin));
   });
   if (hit && hit.slug) return String(hit.slug);
 
@@ -110,7 +120,7 @@ if (process.env.NGUONC_LIST_FILE) {
   try {
     const fs = require("fs");
     const cached = JSON.parse(fs.readFileSync(process.env.NGUONC_LIST_FILE, "utf8"));
-    setNcDetailCache(cached.details || {}, cached.items || []);
+    setNcDetailCache(cached.details || {}, cached.items || [], cached._fetched_at);
     console.log(`[nc] đã nạp cache chi tiết: ${Object.keys(NC_DETAIL_CACHE).length} phim`);
   } catch (e) {
     console.warn(`[nc] không đọc được cache chi tiết: ${e.message}`);
@@ -189,17 +199,29 @@ function ncTitleKey(s) {
     .replace(/\s+/g, " ");
 }
 
-// Detail NguonC chỉ được dùng khi đúng phim: tên (Việt hoặc gốc) khớp hệt và năm
-// lệch tối đa 1. DB có nhiều row ophim_slug trỏ sai sang phim khác, nên phải kiểm
-// tra nội dung detail chứ không tin slug.
+// "Phần 1" và "Phần 2" phải là 2 phim khác nhau — dedupKey bỏ số phần nên cần
+// giữ lại riêng khi so khớp lỏng (bỏ hậu tố "Thuyết minh"/"Vietsub"...).
+function partKey(s) {
+  const m = normalizeStr(String(s || "")).match(/(?:phan|season|mua)\s*(\d+)/);
+  return m ? m[1] : "";
+}
+function looseTitleMatch(a, b) {
+  if (!a || !b) return false;
+  return keysMatch(dedupKey(a), dedupKey(b)) && partKey(a) === partKey(b);
+}
+
+// Detail NguonC chỉ được dùng khi đúng phim: tên khớp (hệt hoặc đã chuẩn hóa,
+// vẫn giữ số phần) và năm lệch tối đa 1. DB có nhiều row ophim_slug trỏ sai sang
+// phim khác, nên phải kiểm tra nội dung detail chứ không tin slug.
 function ncDetailMatches(m, mv) {
   if (!m || !mv) return false;
   const dbYear = parseInt(m.year) || 0;
   const ncYear = parseInt(mv.year || mv.release_year) || 0;
   if (dbYear && ncYear && Math.abs(dbYear - ncYear) > 1) return false;
-  const dbTitles = [m.title, m.titleen].map(ncTitleKey).filter(Boolean);
-  const ncTitles = [mv.name, mv.original_name].map(ncTitleKey).filter(Boolean);
-  return dbTitles.some((a) => ncTitles.some((b) => a === b));
+  const dbTitles = [m.title, m.titleen].filter(Boolean);
+  const ncTitles = [mv.name, mv.original_name].filter(Boolean);
+  return dbTitles.some((a) => ncTitles.some((b) =>
+    ncTitleKey(a) === ncTitleKey(b) || looseTitleMatch(a, b)));
 }
 
 function isDuplicateMovie(candTitle, candTitleEn, candYear, existingList) {
@@ -243,6 +265,26 @@ async function fetchJson(url, ms = 15000, referer = "") {
   // thiếu thì bỏ qua server đó, không làm cả lượt sync chết/ chờ timeout.
   throw lastErr;
 }
+
+// NguonC chặn IP runner bằng Cloudflare (HTTP 403). Khi đã dính 403 trong lượt
+// chạy thì KHÔNG gọi lại nữa — mỗi phim một lần 403 vừa spam log vừa tốn thời
+// gian, mà kết quả vẫn thế. Các lượt sau vẫn thử lại từ đầu (reset ở main).
+let NC_DIRECT_BLOCKED = false;
+function resetNcDirectBlock() { NC_DIRECT_BLOCKED = false; }
+function isNcDirectBlocked() { return NC_DIRECT_BLOCKED; }
+async function fetchNcJson(url, referer = "") {
+  if (NC_DIRECT_BLOCKED) throw new Error("NguonC đang chặn runner (403) — dùng cache nc-cache");
+  try {
+    return await fetchJson(url, 15000, referer);
+  } catch (e) {
+    if (/HTTP 403/.test(e.message)) {
+      NC_DIRECT_BLOCKED = true;
+      console.warn("  NguonC: runner bị chặn (403) — bỏ gọi trực tiếp, dùng cache nc-cache cho các phim sau.");
+    }
+    throw e;
+  }
+}
+
 function pickVietsubServerData(eps) {
   if (!Array.isArray(eps) || !eps.length) return [];
   const isVietsub = (name) => {
@@ -259,7 +301,7 @@ function pickVietsubServerData(eps) {
 // ---------- NguonC ----------
 async function nguoncSearch(keyword, limit = 10) {
   try {
-    const d = await fetchJson(`${NGUONC_BASE}/films/search?keyword=${encodeURIComponent(keyword)}`, 15000, "https://phim.nguonc.com/");
+    const d = await fetchNcJson(`${NGUONC_BASE}/films/search?keyword=${encodeURIComponent(keyword)}`, "https://phim.nguonc.com/");
     return (d?.items || []).slice(0, limit).map((it) => ({
       name: it.name || it.original_name || "",
       origin_name: it.original_name || "",
@@ -336,13 +378,22 @@ function normalizeNcDetail(d, slug = "") {
 }
 
 async function nguoncDetail(slug) {
-  // Ưu tiên tuyệt đối cache: runner không gọi NguonC khi đã có detail trong file.
   const cached = getNcDetail(slug);
-  if (cached) return normalizeNcDetail(cached, slug);
+  const age = getNcCacheAgeMs();
+  // Cache tươi (<=45p) là nguồn chính: runner không cần gọi NguonC (bị 403).
+  if (cached && Number.isFinite(age) && age <= 45 * 60 * 1000) {
+    return normalizeNcDetail(cached, slug);
+  }
+  // Cache cũ: vẫn thử lấy detail mới; nếu runner bị chặn thì dùng lại detail cũ
+  // (đã validate tên/năm ở getNCFullData) thay vì để SV1 trống.
   try {
-    const d = await fetchJson(`${NGUONC_BASE}/film/${encodeURIComponent(slug)}`, 15000, "https://phim.nguonc.com/");
+    const d = await fetchNcJson(`${NGUONC_BASE}/film/${encodeURIComponent(slug)}`, "https://phim.nguonc.com/");
     return normalizeNcDetail(d, slug);
   } catch (e) {
+    if (cached) {
+      console.warn(`  NguonC detail lỗi (${e.message}) → dùng cache cũ cho slug "${slug}"`);
+      return normalizeNcDetail(cached, slug);
+    }
     console.warn("  NguonC detail lỗi:", e.message);
     return { movie: null, episodes: [], slug, error: true };
   }
@@ -709,6 +760,9 @@ function buildAllSourcesUpdate(m, sources) {
     curNum,
     ep,
     hasNewEp: curNum > (parseInt(m.currentep) || 0),
+    // Số tập không đổi nhưng nguồn vừa thêm/sửa link cho tập cũ → vẫn cần ghi DB
+    // và báo trong log (không tạo thông báo để tránh spam).
+    linksChanged: JSON.stringify(oldEpisodes) !== JSON.stringify(episodes),
     metaFrom: leader.src,
     filled: {
       link: episodes.filter((e) => e.link).length,
@@ -1221,9 +1275,10 @@ if (require.main === module) {
 module.exports = {
   SB_URL, SB_KEY, SB_HEADERS, DRY_RUN,
   NGUONC_BASE, KKPHIM_BASE, VODPHIM_BASE,
-  fetchJson, normalizeStr, dedupKey, keysMatch, isDuplicateMovie, extractEpNum,
+  fetchJson, fetchNcJson, resetNcDirectBlock, isNcDirectBlocked,
+  normalizeStr, dedupKey, keysMatch, isDuplicateMovie, extractEpNum,
   pickVietsubServerData, patchMovie, pushNotifs,
-  setNcDetailCache, getNcDetail, findNcSlugFromCache, normalizeNcDetail,
+  setNcDetailCache, getNcDetail, getNcCacheAgeMs, findNcSlugFromCache, normalizeNcDetail,
   flattenNguonCCategory, normEpisodesNC, parseExtra,
   syncFromAllSources, buildAllSourcesUpdate, mergeAllSourceEpisodes,
   insertMovie, GENRE_IMPORT_MAP, COUNTRY_IMPORT_MAP, sleep,
